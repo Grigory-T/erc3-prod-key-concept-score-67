@@ -145,6 +145,40 @@ def get_task_outcome(result_file_path):
         return "ERROR"
 
 
+def get_task_description(task_file_path):
+    """Extract task description from task.txt"""
+    if not os.path.exists(task_file_path):
+        return "N/A"
+    
+    try:
+        with open(task_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Task description is typically on line 5 (index 4) after the header
+        # Format is:
+        # Line 1: ===...
+        # Line 2: TASK N
+        # Line 3: ===...
+        # Line 4: (empty)
+        # Line 5: <description>
+        if len(lines) >= 5:
+            description = lines[4].strip()
+            # Remove any trailing separators or empty lines
+            if description and not description.startswith('-'):
+                return description
+        
+        # Fallback: find first non-empty, non-separator line after header
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if i > 3 and stripped and not stripped.startswith('=') and not stripped.startswith('-') and not stripped.startswith('TASK'):
+                return stripped
+        
+        return "N/A"
+    except Exception as e:
+        print(f"Error reading {task_file_path}: {e}")
+        return "ERROR"
+
+
 def analyze_task(task_number, logs_dir):
     """Analyze a single task and return statistics dictionary"""
     task_id = f"t{task_number:03d}"
@@ -153,6 +187,7 @@ def analyze_task(task_number, logs_dir):
     # Gather all statistics
     stats = {
         'task_id': task_id,
+        'task_description': get_task_description(os.path.join(task_dir, 'task.txt')),
         'initial_plan_steps': count_plan_steps(os.path.join(task_dir, 'plan.txt')),
         'completed_steps': count_completed_steps(task_dir),
         'replans_count': count_replans(os.path.join(task_dir, 'decisions.txt')),
@@ -192,6 +227,7 @@ def main():
     
     fieldnames = [
         'task_id',
+        'task_description',
         'initial_plan_steps',
         'completed_steps',
         'replans_count',

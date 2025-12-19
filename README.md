@@ -1,4 +1,22 @@
-Agent architecture includes:
+# Overview
+This is my LLM agent implementation for ERC3 competition (https://erc.timetoact-group.at/).  
+> Agent scored 67 which is pretty good result.  
+> Agent solved 103 tasks, it took 7 hours and 13$ to complete.  
+
+
+# Folders overview
+**erc3** - agent code  
+**executor** - python interpretor, runs in docker  
+**logs** - full logs of 100 tasks! (planning, reasoning, writing code, code results), interesting to see agent logic and task completiton flow  
+**logs_stats.csv** - summary of all task description and some info on agent completion  
+
+
+# Video with one task log analysis (rus)
+[task t029, youtube](https://www.youtube.com/watch?v=UO4Ej35JtYU)  
+[task t029, vk](https://vkvideo.ru/video-228427241_456239019)
+
+
+# Agent architecture includes:
 
 Preflight check:
 1. When a permission violation is obvious - abort immediately
