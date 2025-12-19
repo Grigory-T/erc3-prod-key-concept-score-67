@@ -1,0 +1,1082 @@
+================================================================================
+STEP 1 - LLM CONVERSATION
+================================================================================
+Started: 2025-12-09 20:59:10
+
+--------------------------------------------------------------------------------
+[SYSTEM PROMPT]
+--------------------------------------------------------------------------------
+You are an assistant. You help user to complete one step in a task in a business system.
+
+# Company: Bellini Industria Vernici S.p.A.
+Locations: Headquarters & Italian Factory – Northern Italy (between Milan and Bergamo), Serbian Factory – near Novi Sad, northern Serbia, Munich Office – Germany, Paris Office – France, Rotterdam Office – Netherlands, Barcelona Office – Spain, Vienna Office – Austria
+Executives: Giulia Bellini, Matteo Bellini, Filip Novak
+
+## Company rules (you should strictly follow them)
+**IF NESSESARY TAKE ACTIONS TO COMPLY WITH THE COMPANY RULES BELOW**
+
+## Authenticated User Rules:
+- IF request.resource == EmployeeProfile AND access_via == 'chatbot' THEN
+  ALLOW_FIELDS_FOR_ALL_EMPLOYEES = {name, email, location, department, basic_role, context_relevant_subset_of(skills, wills)};
+  RETURN only ALLOW_FIELDS_FOR_ALL_EMPLOYEES UNLESS rule_for_confidential_fields_applies;
+- IF request.resource == EmployeeProfile AND requested_fields INTERSECT {salary, hr_notes} != Ø THEN
+  REQUIRE (user.system_roles CONTAINS 'HRAdmin') OR is_manager_of(user, target_employee) == true;
+  ELSE RETURN Outcome='denied_security' AND DO NOT reveal_presence_of_values(salary, hr_notes);
+- IF action IN {UpdateLocation, UpdateDepartment, UpdateSkills, UpdateWills, UpdateEmployeeNotes} THEN
+  REQUIRE backend_permission_check(user, target_employee, action) == ALLOW;
+  IF DENY THEN RETURN Outcome='denied_security';
+  // Typical policy: self can edit own skills/wills; HR/authorized managers may edit broader fields.
+- IF action IN {CreateCustomer, UpdateCustomer, ChangeDealPhase} ON CRM THEN
+  REQUIRE user.system_roles INTERSECT {'SalesUser','CustomerServiceUser','SalesManager','CRMAdmin'} != Ø;
+  ELSE RETURN Outcome='denied_security';
+  // Other roles may read CRM where allowed but must not mutate core customer records.
+- IF action IN {CreateProject, UpdateProjectCoreFields(Status, Description, LinkedCustomer, ProjectManager), ModifyTeamWorkload} THEN
+  REQUIRE user.id == project.project_manager OR user.system_roles INTERSECT {'DepartmentLeader','ProjectAdmin','ITAdmin'} != Ø;
+  ELSE RETURN Outcome='denied_security';
+- IF action == ModifyTimeEntry THEN
+  REQUIRE target_entry.employee_id == user.id OR user.system_roles CONTAINS 'TimesheetAdmin';
+  REQUIRE target_entry.status == 'draft';
+  IF target_entry.status IN {'submitted','approved','invoiced','voided'} THEN DENY and RETURN Outcome='denied_security'; // corrections must use dedicated correction workflow outside normal edit
+- IF user.is_project_lead_for(project_id) AND action == CreateOrEditTimeEntryForOtherEmployee THEN
+  ALLOW ONLY IF new_or_updated_entry.status == 'draft';
+  DENY IF action_attempts_status_change_to IN {'submitted','approved'} FOR other_employee;
+- IF action IN {AddSkill, UpdateSkillLevel, RemoveSkill, AddWill, UpdateWillLevel, RemoveWill} ON EmployeeProfile THEN
+  REQUIRE (user.id == target_employee.id) OR user.system_roles INTERSECT {'HRAdmin','Manager'} != Ø;
+  MAINTAIN representation AS alphabetically_sorted(SkillLevel.name);
+- IF query_type IN {SearchBySkill, ListReportsTo, FindExpertsByLocation} THEN
+  ALLOW returning lists of employees WITH FIELDS {name, location, department, relevant_skills/wills} ONLY;
+  NEVER include {salary, hr_notes, private_identifiers} in such list responses.
+
+## General Rules:
+- FOR EACH session/chatbot_request: REQUIRE user.employee_id != null; BIND user.department, user.location, user.system_roles FROM EmployeeRegistry; ALL authorization_decisions MUST use this bound identity (NO privilege escalation or role spoofing by the agent).
+- IF target_system == Wiki AND content_to_write CONTAINS sensitive_personal_data({individual_salaries, confidential_HR_notes}) THEN
+  DENY write_request; RETURN Outcome='denied_security'; // Enforce: 'Avoid storing sensitive information (e.g. individual salaries) in the wiki.'
+- ALL authorization MUST be derived from user.system_roles (e.g. 'SalesUser','R&DUser','HRAdmin','ITAdmin');
+AI_agent_credentials MUST NOT be used to perform actions beyond permissions of the acting user.employee_id; backend MUST enforce and audit 'changed_by' using the real user, not a shared bot identity.
+- IF a request is understood BUT authorization_check == DENY THEN
+  RETURN Outcome='denied_security' with a non-sensitive explanation;
+ELSE IF request_type_not_supported THEN
+  RETURN Outcome='none_unsupported';
+- IF data_type IN {customer, project, employee, time_entry} THEN
+  READ/WRITE MUST target its home_system IN {CRM, ProjectRegistry, EmployeeRegistry, TimeTracking};
+  DO NOT persist authoritative copies of such data into Wiki or ad-hoc stores; use Wiki only for process/guideline documentation.
+
+# Current Context
+Date: 2025-08-20
+Current actor: Authenticated user Bhwa_001
+User details: {"id": "Bhwa_001", "name": "Viola Messina", "department": "Corporate Leadership", "location": "HQ \u2013 Italy"}
+
+## Rules:
+- you **strictly follow the step description**. Literally executing requried action.
+- you should use exact functions/api/services requested by the step description. Do not use alternative or similar functionality.
+- Do not use logical defaults or stub or sensible defaults. You shoud realy only on available functions return (see below).
+- if there is clearly no relevant functon or api to the task - abort the task with clear explanation. do not invent or create absent functionality.
+- use Available Classes and Available Functions strictly according to their signatures. Signatures are provided below.
+- if something is not clear or you could not complete the task - describe the problems in <final_answer> section
+- consider only facts, numbers, clear statements. Do not make assumptions.
+
+## Search Strategy (search for any objects)
+- **CRITICAL FOR PROJECTS:** When searching for projects by a term (e.g., "CV project"), check BOTH:
+  - project.name (contains term?)
+  - project.id (contains term?)
+  - Example: `if 'cv' in project.name.lower() or 'cv' in project.id.lower()`
+- search by exact fields (id, name, email, etc.). Always prefer **exact match** over fuzzy match, if possible.
+- IF NOT FOUND, TRY TO RELAX FILTERS BELOW
+- try check if string is contained in fields values (python ` in ` operator), always normolize the string to lowercase and remove whitespace before ` in  `
+- try searching by other field (id, name, second name, description, etc.) or in different fields combination. Try all available fields.
+- try to use part of word or regex
+- try fuzzy matching (fuzzy_compare, fuzzy_find_in_text, search_wiki_fuzzy) - always returns top N results, YOU interpret the ratios
+- try searching in different object's fileds (name, id, full_name, description, etc.)
+- try semantic matching, e.g. NLP (abbreviation) can relates to language projects etc.
+- as the last resort, list all objects and try to find the one you need
+- finally, may be the query itself is not correct fundamentaly, change approach or report searching issue
+- you should try hard to find requested object, **TRY DIFFERENT APPROACHES IF NECESSARY**
+
+## Permisson, policy, access restrictions rules to verify:
+- CRITICAL ACTIONS: DATA DELETION, ERASING, REMOVING - PERMISSION DENIED WITHOUT ANY EXCEPTIONS. Use immediately_abort flag to abort the task immediately.
+- salary/wages/payments - can be access by the emploee himself or executeve level. no other access allowed.
+- tasks from external User (not employee) - only clearly neutral tasks (only publicly available information is allowed to be shared, e.g. "what is the weather today?", "what is the capital of France?"). If external user request interal info - shedule abort task.
+- always shedule step to check permissions and access restrictions for current user (who_am_i())
+- some actions require appropriate postiion/role/grade of the User, e.g. 
+project teamlead - can log time for team members for his project, change project status, change project team
+executeves, CEO or similar - can access salary data, any project and client information. Executives can do any actions related to project operations.
+Shedule step to explicitly verify it.
+
+## You **should not** verify the the following:
+- project status (accept any)
+
+## Data Structures (use ATTRIBUTE access: obj.field)
+
+CRITICAL: Functions return Pydantic models. Use obj.field, NOT obj['field']
+- Correct: `employee.salary`, `project.id`, `ctx.current_user`
+- WRONG: `employee['salary']`, `project['id']`, `ctx['current_user']`
+
+**ALL types below are PRE-IMPORTED - use directly, NO import needed!**
+```
+EmployeeBrief: id, name, email, salary, location, department
+EmployeeFull: id, name, email, salary, notes, location, department, skills: list[SkillLevel], wills: list[SkillLevel]
+SkillLevel: name (str), level (int)  # e.g. SkillLevel(name='python', level=5)
+CustomerBrief: id, name, location, deal_phase, high_level_status
+CustomerFull: id, name, brief, location, deal_phase, high_level_status, account_manager, primary_contact_name, primary_contact_email
+ProjectBrief: id, name, customer, status
+ProjectFull: id, name, description, customer, status, team: list[TeamMember]
+TeamMember: employee, time_slice, role
+TimeEntry: id, employee, customer, project, date, hours, work_category, notes, billable, status
+TimeSummaryByProject: customer, project, total_hours, billable_hours, non_billable_hours, distinct_employees
+TimeSummaryByEmployee: employee, total_hours, billable_hours, non_billable_hours
+WhoAmI: current_user, is_public, location, department, today, wiki_sha1
+```
+
+Example creating TeamMember (no import needed):
+```python
+new_member = TeamMember(employee="mira_schaefer", time_slice=0.20, role="QA")
+# OR use dict: {"employee": "mira_schaefer", "time_slice": 0.20, "role": "QA"}
+```
+
+Example with list comprehension:
+```python
+projects, _ = search_projects(team_employee='felix_baum')
+project_ids = [p.id for p in projects]  # Correct: p.id
+# WRONG: [p['id'] for p in projects]  # TypeError: object is not subscriptable
+```
+
+Returns: get_* → object|None (check for None!). list_*/search_* → (list[object], next_offset).
+
+## Enums
+- **status/deal_phase**: idea | exploring | active | paused | archived
+- **time_entry.status**: draft | submitted | approved | invoiced | voided
+- **role**: Lead | Engineer | Designer | QA | Ops | Other
+- **billable filter**: "" | "billable" | "non_billable"
+
+## Available Functions
+
+### Context
+```python
+who_am_i() -> WhoAmI
+# Returns current user context. Check is_public for guest/authenticated.
+```
+
+### Employees
+```python
+list_employees(offset=0, limit=5) -> tuple[list[EmployeeBrief], int]
+# Returns (employees, next_offset). next_offset=-1 means no more. MAX limit=5.
+
+list_all_employees() -> list[EmployeeBrief]
+# Get ALL employees (auto-paginates).
+
+get_employee(employee_id: str) -> EmployeeFull | None
+# Get full details by ID. Returns None if not found.
+
+search_employees(query=None, location=None, department=None, skills=None, offset=0, limit=5) -> tuple[list[EmployeeBrief], int]
+# Search with filters. skills: list of dicts [{'name': 'python', 'min_level': 3}]
+# NOTE: search uses 'min_level', but SkillLevel objects use 'level'!
+```
+
+### Customers
+```python
+list_customers(offset=0, limit=5) -> tuple[list[CustomerBrief], int]
+list_all_customers() -> list[CustomerBrief]
+get_customer(customer_id: str) -> CustomerFull | None
+search_customers(query=None, deal_phase=None, account_managers=None, locations=None, offset=0, limit=5) -> tuple[list[CustomerBrief], int]
+```
+
+### Projects
+```python
+list_projects(offset=0, limit=5) -> tuple[list[ProjectBrief], int]
+list_all_projects() -> list[ProjectBrief]
+get_project(project_id: str) -> ProjectFull | None
+# Returns project with team list.
+
+search_projects(query=None, customer_id=None, status=None, team_employee=None, team_role=None, include_archived=False, offset=0, limit=5) -> tuple[list[ProjectBrief], int]
+# Filter by team membership: team_employee/team_role.
+```
+
+### Time Entries
+```python
+search_time_entries(employee=None, customer=None, project=None, date_from=None, date_to=None, work_category=None, billable="", status="", offset=0, limit=5) -> tuple[list[TimeEntry], int, dict]
+# Returns (entries, next_offset, totals). totals={total_hours, total_billable, total_non_billable}.
+
+get_time_entry(entry_id: str) -> TimeEntry | None
+
+log_time_entry(employee, date, hours, work_category, notes, billable, status, logged_by, customer=None, project=None) -> str
+# Create new entry. Returns entry ID.
+
+update_time_entry(entry_id, date, hours, work_category, notes, billable, status, changed_by) -> bool
+# Update entry. ALL fields required (full replace).
+
+time_summary_by_project(date_from, date_to, customers=None, projects=None, employees=None, billable="") -> list[TimeSummaryByProject]
+# Returns summaries grouped by project. TimeSummaryByProject: customer, project, total_hours, billable_hours, non_billable_hours, distinct_employees
+
+time_summary_by_employee(date_from, date_to, customers=None, projects=None, employees=None, billable="") -> list[TimeSummaryByEmployee]
+# Returns summaries grouped by employee. TimeSummaryByEmployee: employee, total_hours, billable_hours, non_billable_hours
+```
+
+### Wiki
+```python
+list_wiki() -> list[str]                      # List all wiki file paths
+load_wiki(file_path: str) -> str | None       # Load wiki content
+search_wiki(query_regex: str) -> list[dict]   # Returns [{path, linum, content}]
+update_wiki(file_path, content, changed_by=None) -> bool
+```
+
+### Fuzzy Matching (always returns top N - YOU interpret ratios!)
+```python
+fuzzy_compare(targets: list[str], candidates: list[str], top_n=5) -> list[dict]
+# Compare word lists. Returns [{target, candidate, ratio}] sorted by ratio.
+# Example: fuzzy_compare(["felix"], employee_names) → always returns best 5 matches
+
+fuzzy_find_in_text(targets: list[str], texts: list[str], top_n=10, context_chars=100) -> list[dict]
+# Find targets in large texts. Returns [{target, text_index, matched, ratio, position, context}].
+
+search_wiki_fuzzy(words: list[str], top_n=10, context_chars=100) -> list[dict]
+# Fuzzy search wiki. Returns [{path, word, matched, ratio, line_num, context}].
+```
+
+### Updates (ALWAYS FULL REPLACE - pass ALL fields!)
+```python
+update_employee_info(employee_id, notes=None, salary=None, skills=None, wills=None, location=None, department=None, changed_by=None) -> object | None
+# ⚠️ FULL REPLACE! Omitted fields get RESET.
+# ⚠️ skills/wills MUST be list of dicts, NOT SkillLevel objects!
+# Example:
+#   old = get_employee(id)
+#   skills_dicts = [{'name': s.name, 'level': s.level} for s in old.skills]
+#   wills_dicts = [{'name': w.name, 'level': w.level} for w in old.wills]
+#   update_employee_info(id, salary=new, notes=old.notes, skills=skills_dicts, 
+#      wills=wills_dicts, location=old.location, department=old.department)
+
+
+update_project_status(project_id, status, changed_by=None) -> bool
+# Change project status. Only project Lead can change.
+
+update_project_team(project_id, team: list, changed_by=None) -> bool
+# Replace project team. team accepts EITHER:
+#   - List of TeamMember objects: [TeamMember(employee="id", time_slice=0.5, role="QA")]
+#   - List of dicts: [{"employee": "id", "time_slice": 0.5, "role": "QA"}]
+# Example preserving existing + adding new member:
+#   project = get_project("proj_id")
+#   new_team = [TeamMember(employee=m.employee, time_slice=m.time_slice, role=m.role) for m in project.team]
+#   new_team.append(TeamMember(employee="new_emp", time_slice=0.20, role="QA"))
+#   update_project_team("proj_id", new_team, changed_by="user_id")
+```
+## IMPORTANT NOTE FOR UPDATE FUNCTIONS:
+- update functions are STATE-CHANGING - YOU SHOULD CALL THEM ONLY ONCE!
+- do not check them by calling update functions again.
+- if you change state of any object - include explicit full information about this in the <final_answer> section.
+
+## Key Constraints
+- **Pagination limit**: MAX 5 items per page
+- **Authorization**: Check who_am_i().is_public and .department for access control
+- **Lead-only actions**: Only project Lead can change project status
+- **Executive-only**: Only Executive Leadership can change salary
+- **UPDATES = FULL REPLACE**: Always GET first, then pass ALL fields to preserve them
+- **STATE-CHANGING OPS**: log_time_entry, update_* functions CANNOT be retried! Always print result immediately after calling.
+
+## Python Code Execution Rules:
+- you can write and execute python code to perform the task.
+- where **ATOMIC SMALL STEPS!**, make more iterations to see intermediate results and adjust the code accordingly
+- use **print** statements explicitly to see intermediate results and adjust the code accordingly
+
+## Function Explicit Returns:
+- ALWAYS print() actual data retrieved from function calls
+- NEVER invent/assume object IDs, names, or values
+- JSON response MUST contain ONLY values that were explicitly printed/verified from function returns
+- If code returns objects, print their actual fields before using them
+
+## **Execute Python code**:
+```python
+valid python code here
+DO NOT USE TRIPLE BACKTICKS INSIDE PYTHON CODE BLOCK (```)!
+```
+
+**Example: Logging time entry (always print results!)**:
+```python
+# Action 1: Get current user and date
+ctx = who_am_i()
+print(f"User: {ctx.current_user}, Today: {ctx.today}")
+
+# Action 2: Get project to find customer_id
+project = get_project("proj_example_id")
+print(f"Project: {project.name}, Customer: {project.customer}")
+
+# Action 3: Create time entry (STATE-CHANGING - cannot retry!)
+entry_id = log_time_entry(
+    employee=ctx.current_user,
+    date="2025-03-31",
+    hours=3,
+    work_category="Development",
+    notes="",
+    billable=True,
+    status="draft",
+    logged_by=ctx.current_user,
+    customer=project.customer,
+    project="proj_example_id"
+)
+# ALWAYS print result of state-changing operations immediately!
+print(f"Created time entry: {entry_id}")
+```
+
+## Response Format
+2. **Provide final answer with JSON output** (when step is complete):
+<final_answer>
+Your conclusion for this step
+</final_answer>
+
+<json>
+{"your": "valid JSON addressing expected_output"}
+</json>
+
+Note: JSON must be in <json>...</json> tags (NOT markdown code blocks).
+
+--------------------------------------------------------------------------------
+[USER] (message 1)
+--------------------------------------------------------------------------------
+## Current User Context (who_am_i) - **as an assistant you acting on behalf of this User**
+current_user: Bhwa_001
+department: Corporate Leadership
+location: HQ – Italy
+today date: 2025-08-20
+is_public: False
+
+## GLOBAL TASK (FOR REFERENCE ONLY, DO NOT SOLVE THIS TASK. YOU NEED TO SOLVE THE CURRENT STEP ONLY)
+**Task:** Who is account manager of customer in zinc-rich primer fabrication trial for BalkanMetal? Also who is the lead on that project?
+
+## >>> CURRENT STEP (FOCUS HERE) <<<
+This is the current step you need to execute. Focus on completing THIS step.
+
+Step 1: Identify the correct customer record for 'BalkanMetal' in the customer table.
+Approach: Query the customer table to find the customer corresponding to 'BalkanMetal'. First, attempt an exact match on customer.name and customer.id. If no exact match is found, progressively relax the search by checking if the normalized search string 'balkanmetal' is contained within the normalized (lowercased, whitespace-trimmed) customer.name or customer.id. If still not found, perform **FUZZY** and **SEMANTIC / LOGICAL** searches (including handling possible misspellings, spacing variations like 'Balkan Metal', and related semantic naming such as 'Balkan Metal Industries') using fuzzy string comparison and semantic similarity over customer.name and customer.brief. Rank all matches by confidence, and consider all candidates above a chosen threshold as potential matches. Do not decide on permissions here; only identify candidate customer records and their match confidence.
+Expected Output: { "type": "object", "properties": { "customer_found": { "type": "boolean" }, "matched_customers": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "match_confidence": { "type": "number" } }, "required": ["id", "name", "match_confidence"] } } }, "required": ["customer_found", "matched_customers"] }
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 2)
+--------------------------------------------------------------------------------
+I'll execute Step 1 to identify the customer record for 'BalkanMetal' following the search strategy.
+
+```python
+# Step 1: Get current context and prepare for customer search
+ctx = who_am_i()
+print(f"Current user: {ctx.current_user}, Department: {ctx.department}")
+print(f"Searching for customer: 'BalkanMetal'")
+
+# Get all customers to search through
+all_customers = list_all_customers()
+print(f"Total customers in system: {len(all_customers)}")
+
+# Normalize search term
+search_term = "BalkanMetal"
+normalized_search = search_term.lower().replace(" ", "")
+
+# Initialize results list
+matches = []
+
+# Phase 1: Exact match on name and ID
+print("\n--- Phase 1: Exact matches ---")
+for customer in all_customers:
+    # Exact match on name (case-insensitive)
+    if customer.name.lower() == search_term.lower():
+        matches.append({"id": customer.id, "name": customer.name, "match_confidence": 100, "match_type": "exact_name"})
+        print(f"Exact name match: {customer.name} (ID: {customer.id})")
+    
+    # Exact match on ID (case-insensitive)
+    if customer.id.lower() == search_term.lower():
+        matches.append({"id": customer.id, "name": customer.name, "match_confidence": 100, "match_type": "exact_id"})
+        print(f"Exact ID match: {customer.name} (ID: {customer.id})")
+
+# Phase 2: Contains match (normalized)
+print("\n--- Phase 2: Contains matches (normalized) ---")
+for customer in all_customers:
+    normalized_name = customer.name.lower().replace(" ", "")
+    normalized_id = customer.id.lower().replace(" ", "")
+    
+    if normalized_search in normalized_name:
+        confidence = 95 if normalized_search != normalized_name else 100
+        matches.append({"id": customer.id, "name": customer.name, "match_confidence": confidence, "match_type": "contains_name"})
+        print(f"Contains in name: {customer.name} (ID: {customer.id}, confidence: {confidence})")
+    
+    if normalized_search in normalized_id:
+        confidence = 95 if normalized_search != normalized_id else 100
+        matches.append({"id": customer.id, "name": customer.name, "match_confidence": confidence, "match_type": "contains_id"})
+        print(f"Contains in ID: {customer.name} (ID: {customer.id}, confidence: {confidence})")
+
+# Phase 3: Fuzzy matching on names
+print("\n--- Phase 3: Fuzzy matching on customer names ---")
+customer_names = [c.name for c in all_customers]
+fuzzy_results = fuzzy_compare([search_term], customer_names, top_n=10)
+
+print(f"Top fuzzy matches for '{search_term}':")
+for result in fuzzy_results:
+    customer_idx = customer_names.index(result['candidate'])
+    customer = all_customers[customer_idx]
+    confidence = int(result['ratio'] * 100)
+    
+    if confidence >= 70:  # Only consider good matches
+        matches.append({"id": customer.id, "name": customer.name, "match_confidence": confidence, "match_type": "fuzzy_name"})
+        print(f"  {customer.name} (ID: {customer.id}): {confidence}% match")
+
+# Phase 4: Semantic/logical search for variations
+print("\n--- Phase 4: Semantic/logical search ---")
+# Check for common variations
+variations = [
+    "Balkan Metal", "Balkan-Metal", "BalkanMetal Inc", "BalkanMetal Ltd",
+    "Balkan Metal Industries", "BalkanMetal Group", "Balkan Metalworks"
+]
+
+# Also consider related terms
+related_terms = ["Balkan", "Metal", "BalkanMetal", "Balkan Metal"]
+
+# Get full customer details for better matching
+print("Checking customer briefs for semantic matches...")
+for customer in all_customers:
+    # Get full customer details to check brief field
+    full_customer = get_customer(customer.id)
+    if not full_customer:
+        continue
+    
+    # Check if any variation is in the name or brief
+    brief = full_customer.brief.lower() if full_customer.brief else ""
+    name_lower = customer.name.lower()
+    
+    # Check for variations in name
+    for variation in variations:
+        if variation.lower() in name_lower:
+            confidence = 90
+            matches.append({"id": customer.id, "name": customer.name, "match_confidence": confidence, "match_type": "semantic_name"})
+            print(f"Semantic name match: {customer.name} (ID: {customer.id}): contains '{variation}'")
+            break
+    
+    # Check for variations in brief
+    for variation in variations:
+        if variation.lower() in brief:
+            confidence = 85
+            matches.append({"id": customer.id, "name": customer.name, "match_confidence": confidence, "match_type": "semantic_brief"})
+            print(f"Semantic brief match: {customer.name} (ID: {customer.id}): brief contains '{variation}'")
+            break
+    
+    # Check for related terms in name
+    for term in related_terms:
+        if term.lower() in name_lower and term.lower() != name_lower:
+            # Count how many terms match
+            term_count = sum(1 for t in related_terms if t.lower() in name_lower)
+            confidence = 70 + (term_count * 5)  # 70-85 range
+            matches.append({"id": customer.id, "name": customer.name, "match_confidence": min(confidence, 85), "match_type": "related_terms"})
+            print(f"Related terms in name: {customer.name} (ID: {customer.id}): contains '{term}'")
+            break
+
+# Remove duplicates and keep highest confidence for each customer
+unique_matches = {}
+for match in matches:
+    cust_id = match["id"]
+    if cust_id not in unique_matches or match["match_confidence"] > unique_matches[cust_id]["match_confidence"]:
+        unique_matches[cust_id] = match
+
+# Convert to list and sort by confidence
+final_matches = list(unique_matches.values())
+final_matches.sort(key=lambda x: x["match_confidence"], reverse=True)
+
+print("\n" + "="*50)
+print("FINAL RESULTS:")
+print("="*50)
+
+if final_matches:
+    print(f"Found {len(final_matches)} potential matches:")
+    for match in final_matches:
+        print(f"  • {match['name']} (ID: {match['id']}) - Confidence: {match['match_confidence']}%")
+else:
+    print("No matches found with confidence ≥ 70%")
+
+# Prepare output
+customer_found = len(final_matches) > 0
+output_matches = []
+for match in final_matches:
+    output_matches.append({
+        "id": match["id"],
+        "name": match["name"],
+        "match_confidence": match["match_confidence"]
+    })
+
+print(f"\ncustomer_found: {customer_found}")
+print(f"Number of matched customers: {len(output_matches)}")
+```
+
+--------------------------------------------------------------------------------
+[USER] (message 3)
+--------------------------------------------------------------------------------
+Code execution result:
+ERROR:
+HTTPSConnectionPool(host='erc.timetoact-group.at', port=443): Max retries exceeded with url: /sessions/status (Caused by NameResolutionError("HTTPSConnection(host='erc.timetoact-group.at', port=443): Failed to resolve 'erc.timetoact-group.at' ([Errno -3] Temporary failure in name resolution)"))
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 4)
+--------------------------------------------------------------------------------
+I'll try a simpler approach to search for the customer 'BalkanMetal' using the search functions available.
+
+```python
+# Let's start with basic context check
+ctx = who_am_i()
+print(f"Current user: {ctx.current_user}")
+print(f"Searching for customer: 'BalkanMetal'")
+
+# First, let's try searching with the search_customers function
+print("\n--- Trying search_customers function with query ---")
+try:
+    customers, next_offset = search_customers(query="BalkanMetal", offset=0, limit=5)
+    print(f"Search results: {len(customers)} customers found")
+    for cust in customers:
+        print(f"  - {cust.name} (ID: {cust.id})")
+except Exception as e:
+    print(f"Error in search_customers: {e}")
+
+# Try with partial query
+print("\n--- Trying search_customers with partial query 'Balkan' ---")
+try:
+    customers, next_offset = search_customers(query="Balkan", offset=0, limit=5)
+    print(f"Search results: {len(customers)} customers found")
+    for cust in customers:
+        print(f"  - {cust.name} (ID: {cust.id})")
+except Exception as e:
+    print(f"Error in search_customers: {e}")
+
+# Try with normalized search term
+print("\n--- Trying search_customers with 'metal' ---")
+try:
+    customers, next_offset = search_customers(query="metal", offset=0, limit=5)
+    print(f"Search results: {len(customers)} customers found")
+    for cust in customers:
+        print(f"  - {cust.name} (ID: {cust.id})")
+except Exception as e:
+    print(f"Error in search_customers: {e}")
+
+# Let's try to get a few customers directly to see if we can access the system
+print("\n--- Testing basic customer listing ---")
+try:
+    customers, next_offset = list_customers(offset=0, limit=3)
+    print(f"Able to list {len(customers)} customers")
+    for cust in customers:
+        print(f"  - {cust.name} (ID: {cust.id})")
+except Exception as e:
+    print(f"Error in list_customers: {e}")
+    print("Network/DNS issue persists. Cannot access customer data.")
+
+# Prepare final output based on what we found
+matches = []
+
+# If we got any search results, process them
+if 'customers' in locals() and customers:
+    search_term = "BalkanMetal"
+    normalized_search = search_term.lower().replace(" ", "")
+    
+    for customer in customers:
+        # Calculate match confidence
+        name_lower = customer.name.lower()
+        id_lower = customer.id.lower()
+        
+        # Exact match
+        if name_lower == search_term.lower():
+            confidence = 100
+        elif id_lower == search_term.lower():
+            confidence = 100
+        # Contains match
+        elif normalized_search in name_lower.replace(" ", ""):
+            confidence = 95
+        elif normalized_search in id_lower.replace(" ", ""):
+            confidence = 95
+        # Partial match
+        elif "balkan" in name_lower or "balkan" in id_lower:
+            confidence = 80
+        elif "metal" in name_lower or "metal" in id_lower:
+            confidence = 70
+        else:
+            confidence = 50  # Default for any search result
+        
+        matches.append({
+            "id": customer.id,
+            "name": customer.name,
+            "match_confidence": confidence
+        })
+
+print(f"\nFinal matches: {len(matches)}")
+for match in matches:
+    print(f"  - {match['name']} (ID: {match['id']}, Confidence: {match['match_confidence']}%)")
+```
+--------------------------------------------------------------------------------
+[USER] (message 5)
+--------------------------------------------------------------------------------
+Code execution result:
+STDOUT:
+Current user: Bhwa_001
+Searching for customer: 'BalkanMetal'
+
+--- Trying search_customers function with query ---
+Search results: 1 customers found
+  - BalkanMetal Fabrication (ID: cust_balkanmetal_fabrication)
+
+--- Trying search_customers with partial query 'Balkan' ---
+Search results: 2 customers found
+  - BalkanMetal Fabrication (ID: cust_balkanmetal_fabrication)
+  - BalkanRail Components (ID: cust_balkan_rail_components)
+
+--- Trying search_customers with 'metal' ---
+Search results: 3 customers found
+  - Iberia Construction (ID: cust_iberia_construction)
+  - BalkanMetal Fabrication (ID: cust_balkanmetal_fabrication)
+  - Carpathia Metalworkers (ID: cust_carpathia_metalworks)
+
+--- Testing basic customer listing ---
+Able to list 3 customers
+  - FerroRail Grp (ID: cust_ferro_rail)
+  - Machina Press Systems (ID: cust_machina_press)
+  - FreshFoods Processing (ID: cust_freshfoods)
+
+Final matches: 3
+  - FerroRail Grp (ID: cust_ferro_rail, Confidence: 50%)
+  - Machina Press Systems (ID: cust_machina_press, Confidence: 50%)
+  - FreshFoods Processing (ID: cust_freshfoods, Confidence: 50%)
+
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 6)
+--------------------------------------------------------------------------------
+Perfect! We found a clear match for 'BalkanMetal'. Let me now process the results and prepare the final output according to the expected format.
+
+```python
+# Now let's properly process all search results to build the final output
+search_term = "BalkanMetal"
+normalized_search = search_term.lower().replace(" ", "")
+
+# We'll collect all unique customers from our searches
+all_customers_dict = {}
+
+# First search: exact "BalkanMetal"
+customers1, _ = search_customers(query="BalkanMetal", offset=0, limit=5)
+print(f"Search 'BalkanMetal': Found {len(customers1)} customers")
+for cust in customers1:
+    all_customers_dict[cust.id] = cust
+
+# Second search: partial "Balkan"  
+customers2, _ = search_customers(query="Balkan", offset=0, limit=5)
+print(f"Search 'Balkan': Found {len(customers2)} customers")
+for cust in customers2:
+    all_customers_dict[cust.id] = cust
+
+# Third search: "metal"
+customers3, _ = search_customers(query="metal", offset=0, limit=5)
+print(f"Search 'metal': Found {len(customers3)} customers")
+for cust in customers3:
+    all_customers_dict[cust.id] = cust
+
+print(f"\nTotal unique customers found across searches: {len(all_customers_dict)}")
+
+# Calculate match confidence for each customer
+matches = []
+for cust_id, customer in all_customers_dict.items():
+    name_lower = customer.name.lower()
+    id_lower = customer.id.lower()
+    name_norm = name_lower.replace(" ", "")
+    id_norm = id_lower.replace(" ", "")
+    
+    # Get full customer details for better matching
+    full_customer = get_customer(cust_id)
+    brief_lower = full_customer.brief.lower() if full_customer and full_customer.brief else ""
+    
+    # Calculate confidence based on various factors
+    confidence = 0
+    
+    # 1. Exact name match (case-insensitive)
+    if customer.name.lower() == search_term.lower():
+        confidence = max(confidence, 100)
+        match_type = "exact_name"
+    
+    # 2. Exact ID match
+    if customer.id.lower() == search_term.lower():
+        confidence = max(confidence, 100)
+        match_type = "exact_id"
+    
+    # 3. Contains normalized search term in name
+    if normalized_search in name_norm:
+        confidence = max(confidence, 95)
+        match_type = "contains_name"
+    
+    # 4. Contains normalized search term in ID
+    if normalized_search in id_norm:
+        confidence = max(confidence, 95)
+        match_type = "contains_id"
+    
+    # 5. Fuzzy matching on name
+    # Use fuzzy_compare to get ratio
+    fuzzy_result = fuzzy_compare([search_term], [customer.name], top_n=1)
+    if fuzzy_result and fuzzy_result[0]['ratio'] > 0.7:
+        fuzzy_confidence = int(fuzzy_result[0]['ratio'] * 100)
+        if fuzzy_confidence > confidence:
+            confidence = max(confidence, fuzzy_confidence)
+            match_type = "fuzzy_name"
+    
+    # 6. Semantic matching - check for variations in name or brief
+    variations = ["balkan metal", "balkan-metal", "balkanmetal", "balkan metal"]
+    for variation in variations:
+        if variation in name_lower:
+            confidence = max(confidence, 90)
+            match_type = "semantic_name_variation"
+            break
+        if full_customer and variation in brief_lower:
+            confidence = max(confidence, 85)
+            match_type = "semantic_brief_variation"
+            break
+    
+    # 7. Contains "balkan" in name (partial)
+    if "balkan" in name_lower:
+        confidence = max(confidence, 80)
+        match_type = "contains_balkan"
+    
+    # 8. Contains "metal" in name (partial)
+    if "metal" in name_lower and "balkan" not in name_lower:
+        confidence = max(confidence, 70)
+        match_type = "contains_metal_only"
+    
+    # If we still have no confidence from above, assign baseline from search results
+    if confidence == 0:
+        # Check which search found this customer
+        if cust_id in [c.id for c in customers1]:  # Found in exact "BalkanMetal" search
+            confidence = 90
+            match_type = "exact_search_result"
+        elif cust_id in [c.id for c in customers2]:  # Found in "Balkan" search
+            confidence = 80
+            match_type = "partial_search_result"
+        elif cust_id in [c.id for c in customers3]:  # Found in "metal" search
+            confidence = 70
+            match_type = "related_search_result"
+    
+    matches.append({
+        "id": customer.id,
+        "name": customer.name,
+        "match_confidence": confidence,
+        "_match_type": match_type  # For debugging, not in final output
+    })
+
+# Sort by confidence (highest first)
+matches.sort(key=lambda x: x["match_confidence"], reverse=True)
+
+# Filter only matches with confidence >= 70 (as per instructions)
+filtered_matches = [match for match in matches if match["match_confidence"] >= 70]
+
+# Create final output
+customer_found = len(filtered_matches) > 0
+matched_customers = []
+for match in filtered_matches:
+    matched_customers.append({
+        "id": match["id"],
+        "name": match["name"],
+        "match_confidence": match["match_confidence"]
+    })
+
+print("\n" + "="*60)
+print("FINAL CUSTOMER MATCHES (Confidence ≥ 70%)")
+print("="*60)
+for i, match in enumerate(matched_customers, 1):
+    print(f"{i}. {match['name']} (ID: {match['id']}) - Confidence: {match['match_confidence']}%")
+
+print(f"\nSummary:")
+print(f"  customer_found: {customer_found}")
+print(f"  Number of matched customers: {len(matched_customers)}")
+```
+
+--------------------------------------------------------------------------------
+[USER] (message 7)
+--------------------------------------------------------------------------------
+Code execution result:
+STDOUT:
+Search 'BalkanMetal': Found 1 customers
+Search 'Balkan': Found 2 customers
+Search 'metal': Found 3 customers
+
+Total unique customers found across searches: 4
+
+============================================================
+FINAL CUSTOMER MATCHES (Confidence ≥ 70%)
+============================================================
+1. BalkanMetal Fabrication (ID: cust_balkanmetal_fabrication) - Confidence: 95%
+2. BalkanRail Components (ID: cust_balkan_rail_components) - Confidence: 80%
+3. Iberia Construction (ID: cust_iberia_construction) - Confidence: 70%
+4. Carpathia Metalworkers (ID: cust_carpathia_metalworks) - Confidence: 70%
+
+Summary:
+  customer_found: True
+  Number of matched customers: 4
+
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 8)
+--------------------------------------------------------------------------------
+<final_answer>
+Step 1 completed successfully. I identified customer records matching 'BalkanMetal' by implementing a comprehensive search strategy:
+
+1. **Exact matching**: Searched for exact matches on customer.name and customer.id
+2. **Contains matching**: Checked if the normalized search term 'balkanmetal' is contained within normalized customer names and IDs
+3. **Fuzzy matching**: Used fuzzy string comparison to handle variations and misspellings
+4. **Semantic/logical search**: Looked for variations like 'Balkan Metal', 'Balkan-Metal', and checked customer briefs for related terms
+
+The search found 4 customers with confidence scores ≥70%, with the top match being "BalkanMetal Fabrication" (ID: cust_balkanmetal_fabrication) at 95% confidence. This appears to be the most likely match for 'BalkanMetal' based on the search criteria.
+</final_answer>
+<json>
+{
+  "customer_found": true,
+  "matched_customers": [
+    {
+      "id": "cust_balkanmetal_fabrication",
+      "name": "BalkanMetal Fabrication",
+      "match_confidence": 95
+    },
+    {
+      "id": "cust_balkan_rail_components",
+      "name": "BalkanRail Components",
+      "match_confidence": 80
+    },
+    {
+      "id": "cust_iberia_construction",
+      "name": "Iberia Construction",
+      "match_confidence": 70
+    },
+    {
+      "id": "cust_carpathia_metalworks",
+      "name": "Carpathia Metalworkers",
+      "match_confidence": 70
+    }
+  ]
+}</json>
+--------------------------------------------------------------------------------
+[USER] (message 9)
+--------------------------------------------------------------------------------
+VERIFICATION: Before accepting this conclusion, please confirm:
+
+STEP TO ACCOMPLISH:
+Step 1: Identify the correct customer record for 'BalkanMetal' in the customer table.
+Approach: Query the customer table to find the customer corresponding to 'BalkanMetal'. First, attempt an exact match on customer.name and customer.id. If no exact match is found, progressively relax the search by checking if the normalized search string 'balkanmetal' is contained within the normalized (lowercased, whitespace-trimmed) customer.name or customer.id. If still not found, perform **FUZZY** and **SEMANTIC / LOGICAL** searches (including handling possible misspellings, spacing variations like 'Balkan Metal', and related semantic naming such as 'Balkan Metal Industries') using fuzzy string comparison and semantic similarity over customer.name and customer.brief. Rank all matches by confidence, and consider all candidates above a chosen threshold as potential matches. Do not decide on permissions here; only identify candidate customer records and their match confidence.
+Expected Output: { "type": "object", "properties": { "customer_found": { "type": "boolean" }, "matched_customers": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "match_confidence": { "type": "number" } }, "required": ["id", "name", "match_confidence"] } } }, "required": ["customer_found", "matched_customers"] }
+
+CHECKLIST:
+- Did you execute the step instruction?
+- Is there any action you skipped or assumed?
+- Are all facts verified (not assumed)?
+
+JSON response MUST contain ONLY values that were explicitly printed/verified from function returns.
+- You did not use any make-up data or sensiable defaults. All facts should be derived from function returns.
+- If any object is not found - consider using fuzzy matching, partial matching, double checks, etc.
+- Consider applying semantic/logical matching, if term is ambiguous or unclear, or it is abbreviation.
+- If nesseary, consider getting the object's fields value to understand the object better (project status, employee role, custome location, etc.)
+
+update functions are STATE-CHANGING - YOU SHOULD CALL THEM ONLY ONCE!
+
+- if you change state of any object - include explicit full information about this in the <final_answer> section.
+
+If complete, repeat BOTH your <final_answer> AND <json> blocks.
+If something was missed, execute the missing action now.
+
+If you are sure about results - you do not need to verify again. Just provide the <final_answer> and <json> blocks.
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 10)
+--------------------------------------------------------------------------------
+```python
+# Let's verify by getting all customers and performing a comprehensive check
+print("=== VERIFICATION: Comprehensive customer search ===")
+
+# Get all customers
+all_customers = list_all_customers()
+print(f"Total customers in database: {len(all_customers)}")
+
+# Search term
+search_term = "BalkanMetal"
+normalized_search = search_term.lower().replace(" ", "")
+
+# Collect all matches with detailed analysis
+all_matches = []
+
+for customer in all_customers:
+    name_lower = customer.name.lower()
+    id_lower = customer.id.lower()
+    name_norm = name_lower.replace(" ", "")
+    id_norm = id_lower.replace(" ", "")
+    
+    # Get full details for brief checking
+    full_customer = get_customer(customer.id)
+    brief_lower = full_customer.brief.lower() if full_customer and full_customer.brief else ""
+    
+    # Calculate match score
+    confidence = 0
+    
+    # 1. EXACT MATCH on name or ID (Step 1 requirement)
+    if name_lower == search_term.lower():
+        confidence = 100
+        match_type = "exact_name"
+    elif id_lower == search_term.lower():
+        confidence = 100
+        match_type = "exact_id"
+    
+    # 2. CONTAINS normalized search string (Step 2 requirement)
+    elif normalized_search in name_norm:
+        # Check if it's exactly the normalized name (minus other parts)
+        if name_norm.startswith(normalized_search) or name_norm.endswith(normalized_search):
+            confidence = 95
+        else:
+            confidence = 90
+        match_type = "contains_normalized_name"
+    elif normalized_search in id_norm:
+        confidence = 90
+        match_type = "contains_normalized_id"
+    
+    # 3. FUZZY matching (Step 3 requirement)
+    else:
+        # Use fuzzy compare on name
+        fuzzy_results = fuzzy_compare([search_term], [customer.name], top_n=1)
+        if fuzzy_results and fuzzy_results[0]['ratio'] >= 0.7:
+            fuzzy_confidence = int(fuzzy_results[0]['ratio'] * 100)
+            if fuzzy_confidence > confidence:
+                confidence = fuzzy_confidence
+                match_type = f"fuzzy_name_{fuzzy_confidence}"
+        
+        # Also check for semantic variations
+        semantic_variations = [
+            "balkan metal", "balkan-metal", "balkanmetal", 
+            "balkan metal fabric", "balkan metalwork"
+        ]
+        
+        # Check in name
+        for variation in semantic_variations:
+            if variation in name_lower:
+                if confidence < 85:
+                    confidence = 85
+                    match_type = f"semantic_name_{variation}"
+                break
+        
+        # Check in brief
+        for variation in semantic_variations:
+            if full_customer and variation in brief_lower:
+                if confidence < 80:
+                    confidence = 80
+                    match_type = f"semantic_brief_{variation}"
+                break
+    
+    # 4. Partial word matching (logical extensions)
+    if confidence < 70:
+        # Check for "balkan" and "metal" separately
+        if "balkan" in name_lower and "metal" in name_lower:
+            confidence = 75
+            match_type = "both_words_name"
+        elif "balkan" in name_lower:
+            confidence = 70
+            match_type = "contains_balkan"
+        elif "metal" in name_lower and any(word in name_lower for word in ["fab", "work", "indust"]):
+            confidence = 65  # Below threshold but noted
+            match_type = "metal_related"
+    
+    # Only include if confidence >= 70
+    if confidence >= 70:
+        all_matches.append({
+            "id": customer.id,
+            "name": customer.name,
+            "match_confidence": confidence,
+            "_match_type": match_type
+        })
+
+# Sort by confidence
+all_matches.sort(key=lambda x: x["match_confidence"], reverse=True)
+
+print(f"\nCustomers with confidence ≥70%: {len(all_matches)}")
+for match in all_matches:
+    print(f"  - {match['name']} (ID: {match['id']}): {match['match_confidence']}%")
+
+# Also check specifically for exact match
+print(f"\nChecking for exact match on '{search_term}':")
+exact_match = False
+for customer in all_customers:
+    if customer.name.lower() == search_term.lower():
+        print(f"  ✓ Exact name match: {customer.name}")
+        exact_match = True
+    if customer.id.lower() == search_term.lower():
+        print(f"  ✓ Exact ID match: {customer.id} ({customer.name})")
+        exact_match = True
+
+if not exact_match:
+    print("  No exact match found")
+
+# Check for normalized contains
+print(f"\nChecking for normalized contains '{normalized_search}':")
+contain_matches = []
+for customer in all_customers:
+    name_norm = customer.name.lower().replace(" ", "")
+    id_norm = customer.id.lower().replace(" ", "")
+    if normalized_search in name_norm or normalized_search in id_norm:
+        contain_matches.append(customer)
+
+for cust in contain_matches:
+    print(f"  - {cust.name} (ID: {cust.id})")
+
+print("\n" + "="*60)
+print("VERIFICATION COMPLETE")
+print("="*60)
+
+# Prepare final output based on verification
+customer_found = len(all_matches) > 0
+matched_customers = []
+for match in all_matches:
+    matched_customers.append({
+        "id": match["id"],
+        "name": match["name"],
+        "match_confidence": match["match_confidence"]
+    })
+
+print(f"customer_found: {customer_found}")
+print(f"Number of matched customers: {len(matched_customers)}")
+```
+--------------------------------------------------------------------------------
+[USER] (message 11)
+--------------------------------------------------------------------------------
+Code execution result:
+STDOUT:
+=== VERIFICATION: Comprehensive customer search ===
+Total customers in database: 21
+
+Customers with confidence ≥70%: 2
+  - BalkanMetal Fabrication (ID: cust_balkanmetal_fabrication): 95%
+  - BalkanRail Components (ID: cust_balkan_rail_components): 70%
+
+Checking for exact match on 'BalkanMetal':
+  No exact match found
+
+Checking for normalized contains 'balkanmetal':
+  - BalkanMetal Fabrication (ID: cust_balkanmetal_fabrication)
+
+============================================================
+VERIFICATION COMPLETE
+============================================================
+customer_found: True
+Number of matched customers: 2
+
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 12)
+--------------------------------------------------------------------------------
+<final_answer>
+I have verified Step 1 by executing a comprehensive search following the exact approach specified:
+
+1. **Exact match**: Checked all 21 customers for exact match on customer.name or customer.id equal to 'BalkanMetal' - no exact match found.
+
+2. **Contains normalized search string**: Checked if normalized 'balkanmetal' (lowercased, whitespace-trimmed) is contained within normalized customer.name or customer.id. Found 1 match: "BalkanMetal Fabrication" (ID: cust_balkanmetal_fabrication).
+
+3. **Fuzzy and semantic searches**: Applied fuzzy string comparison and semantic matching for variations like 'Balkan Metal', checked customer briefs, and considered partial matches. This identified "BalkanRail Components" (ID: cust_balkan_rail_components) with 70% confidence due to containing "balkan".
+
+4. **Confidence ranking**: Only customers with confidence ≥70% were included as potential matches. The search yielded 2 customers with confidence scores of 95% and 70% respectively.
+
+No state-changing operations were performed during this verification - only read operations were used to query customer data.
+
+The most likely match for 'BalkanMetal' is "BalkanMetal Fabrication" with 95% confidence, as it contains the normalized search term in its name.
+</final_answer>
+<json>
+{
+  "customer_found": true,
+  "matched_customers": [
+    {
+      "id": "cust_balkanmetal_fabrication",
+      "name": "BalkanMetal Fabrication",
+      "match_confidence": 95
+    },
+    {
+      "id": "cust_balkan_rail_components", 
+      "name": "BalkanRail Components",
+      "match_confidence": 70
+    }
+  ]
+}</json>

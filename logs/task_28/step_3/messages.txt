@@ -1,0 +1,916 @@
+================================================================================
+STEP 3 - LLM CONVERSATION
+================================================================================
+Started: 2025-12-09 20:36:25
+
+--------------------------------------------------------------------------------
+[SYSTEM PROMPT]
+--------------------------------------------------------------------------------
+You are an assistant. You help user to complete one step in a task in a business system.
+
+# Company: Bellini Industria Vernici S.p.A.
+Locations: Headquarters & Italian Factory – Northern Italy (between Milan and Bergamo), Serbian Factory – near Novi Sad, northern Serbia, Munich Office – Germany, Paris Office – France, Rotterdam Office – Netherlands, Barcelona Office – Spain, Vienna Office – Austria
+Executives: Giulia Bellini, Matteo Bellini, Filip Novak
+
+## Company rules (you should strictly follow them)
+**IF NESSESARY TAKE ACTIONS TO COMPLY WITH THE COMPANY RULES BELOW**
+
+## Authenticated User Rules:
+- IF request.resource == EmployeeProfile AND access_via == 'chatbot' THEN
+  ALLOW_FIELDS_FOR_ALL_EMPLOYEES = {name, email, location, department, basic_role, context_relevant_subset_of(skills, wills)};
+  RETURN only ALLOW_FIELDS_FOR_ALL_EMPLOYEES UNLESS rule_for_confidential_fields_applies;
+- IF request.resource == EmployeeProfile AND requested_fields INTERSECT {salary, hr_notes} != Ø THEN
+  REQUIRE (user.system_roles CONTAINS 'HRAdmin') OR is_manager_of(user, target_employee) == true;
+  ELSE RETURN Outcome='denied_security' AND DO NOT reveal_presence_of_values(salary, hr_notes);
+- IF action IN {UpdateLocation, UpdateDepartment, UpdateSkills, UpdateWills, UpdateEmployeeNotes} THEN
+  REQUIRE backend_permission_check(user, target_employee, action) == ALLOW;
+  IF DENY THEN RETURN Outcome='denied_security';
+  // Typical policy: self can edit own skills/wills; HR/authorized managers may edit broader fields.
+- IF action IN {CreateCustomer, UpdateCustomer, ChangeDealPhase} ON CRM THEN
+  REQUIRE user.system_roles INTERSECT {'SalesUser','CustomerServiceUser','SalesManager','CRMAdmin'} != Ø;
+  ELSE RETURN Outcome='denied_security';
+  // Other roles may read CRM where allowed but must not mutate core customer records.
+- IF action IN {CreateProject, UpdateProjectCoreFields(Status, Description, LinkedCustomer, ProjectManager), ModifyTeamWorkload} THEN
+  REQUIRE user.id == project.project_manager OR user.system_roles INTERSECT {'DepartmentLeader','ProjectAdmin','ITAdmin'} != Ø;
+  ELSE RETURN Outcome='denied_security';
+- IF action == ModifyTimeEntry THEN
+  REQUIRE target_entry.employee_id == user.id OR user.system_roles CONTAINS 'TimesheetAdmin';
+  REQUIRE target_entry.status == 'draft';
+  IF target_entry.status IN {'submitted','approved','invoiced','voided'} THEN DENY and RETURN Outcome='denied_security'; // corrections must use dedicated correction workflow outside normal edit
+- IF user.is_project_lead_for(project_id) AND action == CreateOrEditTimeEntryForOtherEmployee THEN
+  ALLOW ONLY IF new_or_updated_entry.status == 'draft';
+  DENY IF action_attempts_status_change_to IN {'submitted','approved'} FOR other_employee;
+- IF action IN {AddSkill, UpdateSkillLevel, RemoveSkill, AddWill, UpdateWillLevel, RemoveWill} ON EmployeeProfile THEN
+  REQUIRE (user.id == target_employee.id) OR user.system_roles INTERSECT {'HRAdmin','Manager'} != Ø;
+  MAINTAIN representation AS alphabetically_sorted(SkillLevel.name);
+- IF query_type IN {SearchBySkill, ListReportsTo, FindExpertsByLocation} THEN
+  ALLOW returning lists of employees WITH FIELDS {name, location, department, relevant_skills/wills} ONLY;
+  NEVER include {salary, hr_notes, private_identifiers} in such list responses.
+
+## General Rules:
+- FOR EACH session/chatbot_request: REQUIRE user.employee_id != null; BIND user.department, user.location, user.system_roles FROM EmployeeRegistry; ALL authorization_decisions MUST use this bound identity (NO privilege escalation or role spoofing by the agent).
+- IF target_system == Wiki AND content_to_write CONTAINS sensitive_personal_data({individual_salaries, confidential_HR_notes}) THEN
+  DENY write_request; RETURN Outcome='denied_security'; // Enforce: 'Avoid storing sensitive information (e.g. individual salaries) in the wiki.'
+- ALL authorization MUST be derived from user.system_roles (e.g. 'SalesUser','R&DUser','HRAdmin','ITAdmin');
+AI_agent_credentials MUST NOT be used to perform actions beyond permissions of the acting user.employee_id; backend MUST enforce and audit 'changed_by' using the real user, not a shared bot identity.
+- IF a request is understood BUT authorization_check == DENY THEN
+  RETURN Outcome='denied_security' with a non-sensitive explanation;
+ELSE IF request_type_not_supported THEN
+  RETURN Outcome='none_unsupported';
+- IF data_type IN {customer, project, employee, time_entry} THEN
+  READ/WRITE MUST target its home_system IN {CRM, ProjectRegistry, EmployeeRegistry, TimeTracking};
+  DO NOT persist authoritative copies of such data into Wiki or ad-hoc stores; use Wiki only for process/guideline documentation.
+
+# Current Context
+Date: 2025-04-03
+Current actor: Authenticated user 6KR2_024
+User details: {"id": "6KR2_024", "name": "Laurent Pons", "department": "Sales & Customer Success", "location": "Paris Office \u2013 France"}
+
+## Rules:
+- you **strictly follow the step description**. Literally executing requried action.
+- you should use exact functions/api/services requested by the step description. Do not use alternative or similar functionality.
+- Do not use logical defaults or stub or sensible defaults. You shoud realy only on available functions return (see below).
+- if there is clearly no relevant functon or api to the task - abort the task with clear explanation. do not invent or create absent functionality.
+- use Available Classes and Available Functions strictly according to their signatures. Signatures are provided below.
+- if something is not clear or you could not complete the task - describe the problems in <final_answer> section
+- consider only facts, numbers, clear statements. Do not make assumptions.
+
+## Search Strategy (search for any objects)
+- **CRITICAL FOR PROJECTS:** When searching for projects by a term (e.g., "CV project"), check BOTH:
+  - project.name (contains term?)
+  - project.id (contains term?)
+  - Example: `if 'cv' in project.name.lower() or 'cv' in project.id.lower()`
+- search by exact fields (id, name, email, etc.). Always prefer **exact match** over fuzzy match, if possible.
+- IF NOT FOUND, TRY TO RELAX FILTERS BELOW
+- try check if string is contained in fields values (python ` in ` operator), always normolize the string to lowercase and remove whitespace before ` in  `
+- try searching by other field (id, name, second name, description, etc.) or in different fields combination. Try all available fields.
+- try to use part of word or regex
+- try fuzzy matching (fuzzy_compare, fuzzy_find_in_text, search_wiki_fuzzy) - always returns top N results, YOU interpret the ratios
+- try searching in different object's fileds (name, id, full_name, description, etc.)
+- try semantic matching, e.g. NLP (abbreviation) can relates to language projects etc.
+- as the last resort, list all objects and try to find the one you need
+- finally, may be the query itself is not correct fundamentaly, change approach or report searching issue
+- you should try hard to find requested object, **TRY DIFFERENT APPROACHES IF NECESSARY**
+
+## Permisson, policy, access restrictions rules to verify:
+- CRITICAL ACTIONS: DATA DELETION, ERASING, REMOVING - PERMISSION DENIED WITHOUT ANY EXCEPTIONS. Use immediately_abort flag to abort the task immediately.
+- salary/wages/payments - can be access by the emploee himself or executeve level. no other access allowed.
+- tasks from external User (not employee) - only clearly neutral tasks (only publicly available information is allowed to be shared, e.g. "what is the weather today?", "what is the capital of France?"). If external user request interal info - shedule abort task.
+- always shedule step to check permissions and access restrictions for current user (who_am_i())
+- some actions require appropriate postiion/role/grade of the User, e.g. 
+project teamlead - can log time for team members for his project, change project status, change project team
+executeves, CEO or similar - can access salary data, any project and client information. Executives can do any actions related to project operations.
+Shedule step to explicitly verify it.
+
+## You **should not** verify the the following:
+- project status (accept any)
+
+## Data Structures (use ATTRIBUTE access: obj.field)
+
+CRITICAL: Functions return Pydantic models. Use obj.field, NOT obj['field']
+- Correct: `employee.salary`, `project.id`, `ctx.current_user`
+- WRONG: `employee['salary']`, `project['id']`, `ctx['current_user']`
+
+**ALL types below are PRE-IMPORTED - use directly, NO import needed!**
+```
+EmployeeBrief: id, name, email, salary, location, department
+EmployeeFull: id, name, email, salary, notes, location, department, skills: list[SkillLevel], wills: list[SkillLevel]
+SkillLevel: name (str), level (int)  # e.g. SkillLevel(name='python', level=5)
+CustomerBrief: id, name, location, deal_phase, high_level_status
+CustomerFull: id, name, brief, location, deal_phase, high_level_status, account_manager, primary_contact_name, primary_contact_email
+ProjectBrief: id, name, customer, status
+ProjectFull: id, name, description, customer, status, team: list[TeamMember]
+TeamMember: employee, time_slice, role
+TimeEntry: id, employee, customer, project, date, hours, work_category, notes, billable, status
+TimeSummaryByProject: customer, project, total_hours, billable_hours, non_billable_hours, distinct_employees
+TimeSummaryByEmployee: employee, total_hours, billable_hours, non_billable_hours
+WhoAmI: current_user, is_public, location, department, today, wiki_sha1
+```
+
+Example creating TeamMember (no import needed):
+```python
+new_member = TeamMember(employee="mira_schaefer", time_slice=0.20, role="QA")
+# OR use dict: {"employee": "mira_schaefer", "time_slice": 0.20, "role": "QA"}
+```
+
+Example with list comprehension:
+```python
+projects, _ = search_projects(team_employee='felix_baum')
+project_ids = [p.id for p in projects]  # Correct: p.id
+# WRONG: [p['id'] for p in projects]  # TypeError: object is not subscriptable
+```
+
+Returns: get_* → object|None (check for None!). list_*/search_* → (list[object], next_offset).
+
+## Enums
+- **status/deal_phase**: idea | exploring | active | paused | archived
+- **time_entry.status**: draft | submitted | approved | invoiced | voided
+- **role**: Lead | Engineer | Designer | QA | Ops | Other
+- **billable filter**: "" | "billable" | "non_billable"
+
+## Available Functions
+
+### Context
+```python
+who_am_i() -> WhoAmI
+# Returns current user context. Check is_public for guest/authenticated.
+```
+
+### Employees
+```python
+list_employees(offset=0, limit=5) -> tuple[list[EmployeeBrief], int]
+# Returns (employees, next_offset). next_offset=-1 means no more. MAX limit=5.
+
+list_all_employees() -> list[EmployeeBrief]
+# Get ALL employees (auto-paginates).
+
+get_employee(employee_id: str) -> EmployeeFull | None
+# Get full details by ID. Returns None if not found.
+
+search_employees(query=None, location=None, department=None, skills=None, offset=0, limit=5) -> tuple[list[EmployeeBrief], int]
+# Search with filters. skills: list of dicts [{'name': 'python', 'min_level': 3}]
+# NOTE: search uses 'min_level', but SkillLevel objects use 'level'!
+```
+
+### Customers
+```python
+list_customers(offset=0, limit=5) -> tuple[list[CustomerBrief], int]
+list_all_customers() -> list[CustomerBrief]
+get_customer(customer_id: str) -> CustomerFull | None
+search_customers(query=None, deal_phase=None, account_managers=None, locations=None, offset=0, limit=5) -> tuple[list[CustomerBrief], int]
+```
+
+### Projects
+```python
+list_projects(offset=0, limit=5) -> tuple[list[ProjectBrief], int]
+list_all_projects() -> list[ProjectBrief]
+get_project(project_id: str) -> ProjectFull | None
+# Returns project with team list.
+
+search_projects(query=None, customer_id=None, status=None, team_employee=None, team_role=None, include_archived=False, offset=0, limit=5) -> tuple[list[ProjectBrief], int]
+# Filter by team membership: team_employee/team_role.
+```
+
+### Time Entries
+```python
+search_time_entries(employee=None, customer=None, project=None, date_from=None, date_to=None, work_category=None, billable="", status="", offset=0, limit=5) -> tuple[list[TimeEntry], int, dict]
+# Returns (entries, next_offset, totals). totals={total_hours, total_billable, total_non_billable}.
+
+get_time_entry(entry_id: str) -> TimeEntry | None
+
+log_time_entry(employee, date, hours, work_category, notes, billable, status, logged_by, customer=None, project=None) -> str
+# Create new entry. Returns entry ID.
+
+update_time_entry(entry_id, date, hours, work_category, notes, billable, status, changed_by) -> bool
+# Update entry. ALL fields required (full replace).
+
+time_summary_by_project(date_from, date_to, customers=None, projects=None, employees=None, billable="") -> list[TimeSummaryByProject]
+# Returns summaries grouped by project. TimeSummaryByProject: customer, project, total_hours, billable_hours, non_billable_hours, distinct_employees
+
+time_summary_by_employee(date_from, date_to, customers=None, projects=None, employees=None, billable="") -> list[TimeSummaryByEmployee]
+# Returns summaries grouped by employee. TimeSummaryByEmployee: employee, total_hours, billable_hours, non_billable_hours
+```
+
+### Wiki
+```python
+list_wiki() -> list[str]                      # List all wiki file paths
+load_wiki(file_path: str) -> str | None       # Load wiki content
+search_wiki(query_regex: str) -> list[dict]   # Returns [{path, linum, content}]
+update_wiki(file_path, content, changed_by=None) -> bool
+```
+
+### Fuzzy Matching (always returns top N - YOU interpret ratios!)
+```python
+fuzzy_compare(targets: list[str], candidates: list[str], top_n=5) -> list[dict]
+# Compare word lists. Returns [{target, candidate, ratio}] sorted by ratio.
+# Example: fuzzy_compare(["felix"], employee_names) → always returns best 5 matches
+
+fuzzy_find_in_text(targets: list[str], texts: list[str], top_n=10, context_chars=100) -> list[dict]
+# Find targets in large texts. Returns [{target, text_index, matched, ratio, position, context}].
+
+search_wiki_fuzzy(words: list[str], top_n=10, context_chars=100) -> list[dict]
+# Fuzzy search wiki. Returns [{path, word, matched, ratio, line_num, context}].
+```
+
+### Updates (ALWAYS FULL REPLACE - pass ALL fields!)
+```python
+update_employee_info(employee_id, notes=None, salary=None, skills=None, wills=None, location=None, department=None, changed_by=None) -> object | None
+# ⚠️ FULL REPLACE! Omitted fields get RESET.
+# ⚠️ skills/wills MUST be list of dicts, NOT SkillLevel objects!
+# Example:
+#   old = get_employee(id)
+#   skills_dicts = [{'name': s.name, 'level': s.level} for s in old.skills]
+#   wills_dicts = [{'name': w.name, 'level': w.level} for w in old.wills]
+#   update_employee_info(id, salary=new, notes=old.notes, skills=skills_dicts, 
+#      wills=wills_dicts, location=old.location, department=old.department)
+
+
+update_project_status(project_id, status, changed_by=None) -> bool
+# Change project status. Only project Lead can change.
+
+update_project_team(project_id, team: list, changed_by=None) -> bool
+# Replace project team. team accepts EITHER:
+#   - List of TeamMember objects: [TeamMember(employee="id", time_slice=0.5, role="QA")]
+#   - List of dicts: [{"employee": "id", "time_slice": 0.5, "role": "QA"}]
+# Example preserving existing + adding new member:
+#   project = get_project("proj_id")
+#   new_team = [TeamMember(employee=m.employee, time_slice=m.time_slice, role=m.role) for m in project.team]
+#   new_team.append(TeamMember(employee="new_emp", time_slice=0.20, role="QA"))
+#   update_project_team("proj_id", new_team, changed_by="user_id")
+```
+## IMPORTANT NOTE FOR UPDATE FUNCTIONS:
+- update functions are STATE-CHANGING - YOU SHOULD CALL THEM ONLY ONCE!
+- do not check them by calling update functions again.
+- if you change state of any object - include explicit full information about this in the <final_answer> section.
+
+## Key Constraints
+- **Pagination limit**: MAX 5 items per page
+- **Authorization**: Check who_am_i().is_public and .department for access control
+- **Lead-only actions**: Only project Lead can change project status
+- **Executive-only**: Only Executive Leadership can change salary
+- **UPDATES = FULL REPLACE**: Always GET first, then pass ALL fields to preserve them
+- **STATE-CHANGING OPS**: log_time_entry, update_* functions CANNOT be retried! Always print result immediately after calling.
+
+## Python Code Execution Rules:
+- you can write and execute python code to perform the task.
+- where **ATOMIC SMALL STEPS!**, make more iterations to see intermediate results and adjust the code accordingly
+- use **print** statements explicitly to see intermediate results and adjust the code accordingly
+
+## Function Explicit Returns:
+- ALWAYS print() actual data retrieved from function calls
+- NEVER invent/assume object IDs, names, or values
+- JSON response MUST contain ONLY values that were explicitly printed/verified from function returns
+- If code returns objects, print their actual fields before using them
+
+## **Execute Python code**:
+```python
+valid python code here
+DO NOT USE TRIPLE BACKTICKS INSIDE PYTHON CODE BLOCK (```)!
+```
+
+**Example: Logging time entry (always print results!)**:
+```python
+# Action 1: Get current user and date
+ctx = who_am_i()
+print(f"User: {ctx.current_user}, Today: {ctx.today}")
+
+# Action 2: Get project to find customer_id
+project = get_project("proj_example_id")
+print(f"Project: {project.name}, Customer: {project.customer}")
+
+# Action 3: Create time entry (STATE-CHANGING - cannot retry!)
+entry_id = log_time_entry(
+    employee=ctx.current_user,
+    date="2025-03-31",
+    hours=3,
+    work_category="Development",
+    notes="",
+    billable=True,
+    status="draft",
+    logged_by=ctx.current_user,
+    customer=project.customer,
+    project="proj_example_id"
+)
+# ALWAYS print result of state-changing operations immediately!
+print(f"Created time entry: {entry_id}")
+```
+
+## Response Format
+2. **Provide final answer with JSON output** (when step is complete):
+<final_answer>
+Your conclusion for this step
+</final_answer>
+
+<json>
+{"your": "valid JSON addressing expected_output"}
+</json>
+
+Note: JSON must be in <json>...</json> tags (NOT markdown code blocks).
+
+--------------------------------------------------------------------------------
+[USER] (message 1)
+--------------------------------------------------------------------------------
+## Current User Context (who_am_i) - **as an assistant you acting on behalf of this User**
+current_user: 6KR2_024
+department: Sales & Customer Success
+location: Paris Office – France
+today date: 2025-04-03
+is_public: False
+
+## GLOBAL TASK (FOR REFERENCE ONLY, DO NOT SOLVE THIS TASK. YOU NEED TO SOLVE THE CURRENT STEP ONLY)
+**Task:** Who is customer for paused coating rationalisation project for Machina Press Systems
+
+## Previous Steps of Task Plan Completed
+
+### Step 1
+Step 1: Clarify domain-specific terms and project naming conventions related to 'coating rationalisation' and 'Machina Press Systems' using internal wiki or documentation.
+Approach: Perform a FUZZY and SEMANTIC / LOGICAL search in the wiki_file table (and any internal documentation index if available) for terms and variations including 'coating rationalisation', 'coating rationalization', 'Machina Press Systems', 'MachinaPress', and related phrases. Account explicitly for potential spelling mistakes, spacing differences, hyphenation, and partial names using fuzzy matching, partial string matching, and semantic similarity. Use these findings to better understand whether 'Machina Press Systems' is typically a customer name, a project name component, or an internal codename, and capture any canonical spellings or abbreviations.
+Expected Output: {"type":"object","properties":{"wiki_entries":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"excerpt":{"type":"string"},"relevance_score":{"type":"number"}},"required":["path","relevance_score"]}}},"required":["wiki_entries"]}
+**Result:** I have completed Step 1 by performing an extensive fuzzy and semantic search across all internal wiki files. The search covered the exact terms and variations including 'coating rationalisation', 'coating rationalization', 'Machina Press Systems', 'MachinaPress', and related phrases, accounting for potential spelling mistakes, spacing differences, hyphenation, and partial names. All findings are based directly on function returns from the search operations, with no assumptions or made-up data.
+
+Key findings from the search:
+- "MachinaPress" appears in the CRM documentation (systems/crm.md) with a fuzzy match ratio of 0.75, suggesting this is likely a customer name format used internally.
+- "Machina Press Systems" appears in marketing context (business/marketing_and_sales_approach.md) with a fuzzy match ratio of 0.71.
+- "rationalisation" appears in company history (company/history.md) with a fuzzy match ratio of 0.73, but not specifically linked to coatings.
+- No exact matches were found for "coating rationalisation" or "coating rationalization" in any wiki file.
+- Project naming conventions are documented in systems/project_registry.md, with examples of coating-related projects.
+
+Based on these findings, "Machina Press Systems" appears to be a customer name rather than a project name component, and "coating rationalisation" is not a documented project type in the wiki, though it could be a specific project description.
+
+{
+  "wiki_entries": [
+    {
+      "path": "systems/crm.md",
+      "excerpt": "**high‑level opportunity tracking**.\n\n## What is stored in the CRM?\n\nFor each **customer company**:\n\n- Customer ID (internal)\n- Name and legal form\n- Main address and country\n- Industry segment (e.g. Rail, Food & Beverage, General Industry)\n- Primary contact name and email\n- Assigned account manager (employee I",
+      "relevance_score": 0.75
+    },
+    {
+      "path": "company/history.md",
+      "excerpt": "ring WWII. Post‑war reconstruction creates strong demand for paints and coatings, and Bellini rebuilds and expands its facility.\n\n## 1950–1980: Industrialisation and export\n\n- **1950s – New factory.** A more modern plant is built on the outskirts of the town, with larger batch mixers and better quality control.\n-",
+      "relevance_score": 0.73
+    },
+    {
+      "path": "systems/project_registry.md",
+      "excerpt": "y, HR, IT and digitalisation.\n\n## Workload\n\nEmployee workload in Bellini Coatings is determined by a combination of:\n- Project assignments (time‑slice commitments).\n- Ongoing departmental tasks.\n- Support and administrative duties.\n\nEach employee’s total workload should not exceed 100% of their available time, although short‑term peaks are allowed.\n\n## Examples",
+      "relevance_score": 0.73
+    },
+    {
+      "path": "business/marketing_and_sales_approach.md",
+      "excerpt": "s, confirmations, basic queries and complaints.\n  - Maintain records in CRM and support account managers.\n\n## CRM usage principles\n\nEven though our CRM and project systems are built on **legacy technology**, they are the **single source of truth** for:\n\n- Customer master data.\n- Key contacts and roles.\n- Active and rece",
+      "relevance_score": 0.71
+    },
+    {
+      "path": "business/markets_and_customers.md",
+      "excerpt": "# Markets and Customers\n\nBellini Coatings serves industrial customers across **Western and Central Europe**, with selected exports to the Balkans and neighbouring regions. Our main market segments are:\n\n- **Rail & rolling stock** – Protective and decorative coatings for trains, trams, metro vehicles and infrastructure.\n- **Food & Beverage** – Coatings for food‑processing equipment, breweries, dairies and packaging lines.\n- **General Industry** – Machinery, steel structures, agricultural equipment, warehouses and factories.\n- **Infrastructure** – Bridges, ports, utility structures and public buildings.",
+      "relevance_score": 0.65
+    }
+  ]
+}
+
+### Step 2
+Step 2: Identify the technical implementation (databases, tables, or services) that store project and customer records to answer questions about project customers.
+Approach: Using system architecture documentation or metadata, perform a FUZZY and SEMANTIC / LOGICAL search for project and customer storage mechanisms (for example, SQL tables, APIs, or services). Confirm that the SQL tables 'project' and 'customer' are the authoritative sources for project and customer data. Verify accessible interfaces (for example direct SQL query layer or an internal service) that can be used to read from these tables. If no such technical mechanism is available, this will be used later to justify aborting the task as not implemented.
+Expected Output: {"type":"object","properties":{"project_storage":{"type":"string"},"customer_storage":{"type":"string"},"access_method":{"type":"string"},"implementation_found":{"type":"boolean"}},"required":["project_storage","customer_storage","implementation_found"]}
+**Result:** I have completed Step 2 by thoroughly executing the required fuzzy and semantic/logical search across all available system architecture documentation. I examined wiki files, performed targeted searches for storage mechanisms, and verified all facts directly from function returns. The search confirmed that project records are stored in the Project Registry system and customer records in the CRM system, both built on the legacy Progress OpenEdge database technology. Access is provided through a chatbot API wrapper that exposes functions for reading and writing to these systems. No state-changing operations were performed during this step.
+
+{
+  "project_storage": "Project Registry system built on Progress OpenEdge database (legacy system)",
+  "customer_storage": "CRM (Customer Relationship Management) system built on Progress OpenEdge database (legacy system)",
+  "access_method": "Chatbot API wrapper providing functions (list_projects, get_project, search_projects, list_customers, get_customer, search_customers, etc.) to interact with legacy systems via APIs",
+  "implementation_found": true
+}
+
+## >>> CURRENT STEP (FOCUS HERE) <<<
+This is the current step you need to execute. Focus on completing THIS step.
+
+Step 3: Locate the specific project record corresponding to the 'coating rationalisation project for Machina Press Systems' in the project table.
+Approach: Query the project table using a tiered search strategy. First attempt exact match filters on the name field for phrases like 'coating rationalisation project for Machina Press Systems' (normalized to lowercase and trimmed). If no exact match is found, progressively relax the criteria: (1) check if normalized substrings such as 'coating rationalisation', 'coating rationalization', and 'machina press systems' are contained in the project.name or project.description using lowercase, whitespace-stripped comparisons; (2) apply regular expressions or partial-word matches; (3) use FUZZY and SEMANTIC / LOGICAL matching to compare the query phrase against project.name and project.description, including tolerance for misspellings, swapped word order, and abbreviations. Return a list of candidate projects with their identifiers, names, and match scores, clearly indicating if zero, one, or multiple candidates were found.
+Expected Output: {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"object","properties":{"project_id":{"type":"string"},"project_name":{"type":"string"},"match_score":{"type":"number"}},"required":["project_id","project_name","match_score"]}},"candidate_count":{"type":"integer"}},"required":["candidates","candidate_count"]}
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 2)
+--------------------------------------------------------------------------------
+I'll execute Step 3 by searching for the project using a tiered approach. Let me start by getting the current user context and then implementing the search strategy.
+
+```python
+# First, get current user context
+ctx = who_am_i()
+print(f"Current user: {ctx.current_user}, Department: {ctx.department}, Location: {ctx.location}")
+print(f"Today: {ctx.today}")
+
+# Define target search phrases
+target_full = "coating rationalisation project for Machina Press Systems"
+target_coating_rationalisation = "coating rationalisation"
+target_coating_rationalization = "coating rationalization"
+target_machina = "Machina Press Systems"
+target_machina_lower = "machina press systems"
+
+# Initialize results
+candidates = []
+all_projects_briefs = []
+
+print("\n=== Step 1: Searching for customer 'Machina Press Systems' ===")
+# First, let's find the customer to get customer_id
+customers, _ = search_customers(query=target_machina)
+print(f"Found {len(customers)} customers matching '{target_machina}':")
+for cust in customers:
+    print(f"  - ID: {cust.id}, Name: {cust.name}, Location: {cust.location}, Deal Phase: {cust.deal_phase}")
+
+# Try fuzzy search for customer
+all_customers = list_all_customers()
+machina_customers = []
+for cust in all_customers:
+    if target_machina_lower in cust.name.lower():
+        machina_customers.append(cust)
+        print(f"  Exact substring match: {cust.id} - {cust.name}")
+
+print(f"\nTotal customers with 'machina' in name: {len(machina_customers)}")
+
+# Get customer IDs for filtering
+customer_ids = [cust.id for cust in machina_customers]
+
+print("\n=== Step 2: Direct project search with query strings ===")
+# Try search with different query strings
+search_queries = [
+    target_full,
+    target_coating_rationalisation,
+    target_coating_rationalization,
+    target_machina,
+    "coating",
+    "rationalisation",
+    "machina"
+]
+
+for query in search_queries:
+    print(f"\nSearching projects with query: '{query}'")
+    projects, next_offset = search_projects(query=query, limit=5)
+    print(f"  Found {len(projects)} projects")
+    for proj in projects:
+        print(f"  - {proj.id}: {proj.name} (Customer: {proj.customer})")
+
+print("\n=== Step 3: Search projects by customer ID ===")
+if customer_ids:
+    for cust_id in customer_ids:
+        print(f"\nSearching projects for customer ID: {cust_id}")
+        projects, next_offset = search_projects(customer_id=cust_id, limit=5)
+        print(f"  Found {len(projects)} projects")
+        for proj in projects:
+            print(f"  - {proj.id}: {proj.name} (Status: {proj.status})")
+            # Check if project is paused
+            if proj.status == "paused":
+                print(f"    *** PAUSED PROJECT ***")
+else:
+    print("No customer IDs found, skipping customer-specific search")
+
+print("\n=== Step 4: Get all projects for fuzzy matching ===")
+# Get all projects for comprehensive search
+all_projects = list_all_projects()
+print(f"Total projects in system: {len(all_projects)}")
+all_projects_briefs = all_projects
+
+# Prepare project names for fuzzy matching
+project_names = [p.name for p in all_projects]
+project_ids = [p.id for p in all_projects]
+
+print("\n=== Step 5: Fuzzy matching on project names ===")
+# Use fuzzy_compare to find matches
+target_phrases = [
+    target_full,
+    target_coating_rationalisation,
+    target_coating_rationalization,
+    target_machina,
+    "coating rationalisation machina",
+    "machina press coating"
+]
+
+# We'll do fuzzy matching for each target phrase
+for target in target_phrases:
+    print(f"\nFuzzy matching target: '{target}'")
+    results = fuzzy_compare([target], project_names, top_n=5)
+    
+    for result in results:
+        idx = project_names.index(result['candidate'])
+        project = all_projects[idx]
+        match_score = result['ratio']
+        
+        # Only consider matches with reasonable score (e.g., > 0.4)
+        if match_score > 0.4:
+            print(f"  Match score {match_score:.2f}: {project.id} - '{project.name}'")
+            
+            # Check if this project is already in candidates
+            existing = next((c for c in candidates if c['project_id'] == project.id), None)
+            if not existing:
+                candidates.append({
+                    'project_id': project.id,
+                    'project_name': project.name,
+                    'match_score': match_score
+                })
+
+print("\n=== Step 6: Check project descriptions ===")
+# For candidates found so far, and for projects that might have relevant terms in description
+# Let's also check all projects for substring matches in name
+coating_projects = []
+rationalisation_projects = []
+machina_projects = []
+
+for project in all_projects:
+    name_lower = project.name.lower()
+    
+    # Check for substring matches
+    if 'coating' in name_lower:
+        coating_projects.append(project)
+    if 'rationalisation' in name_lower or 'rationalization' in name_lower:
+        rationalisation_projects.append(project)
+    if 'machina' in name_lower:
+        machina_projects.append(project)
+    
+    # Also check for combined terms
+    if ('coating' in name_lower and 'rationalisation' in name_lower) or \
+       ('coating' in name_lower and 'rationalization' in name_lower):
+        print(f"  Found project with both 'coating' and 'rationalisation': {project.id} - {project.name}")
+
+print(f"\nProjects with 'coating' in name: {len(coating_projects)}")
+print(f"Projects with 'rationalisation/rationalization' in name: {len(rationalisation_projects)}")
+print(f"Projects with 'machina' in name: {len(machina_projects)}")
+
+# Add any machina projects with reasonable match
+for project in machina_projects:
+    existing = next((c for c in candidates if c['project_id'] == project.id), None)
+    if not existing:
+        # Calculate a match score based on presence
+        score = 0.6  # Base score for containing 'machina'
+        candidates.append({
+            'project_id': project.id,
+            'project_name': project.name,
+            'match_score': score
+        })
+
+print("\n=== Step 7: Check for paused projects ===")
+# Specifically look for paused projects that might be relevant
+paused_projects = []
+for project in all_projects:
+    if project.status == "paused":
+        paused_projects.append(project)
+        # Check if it has relevant terms
+        name_lower = project.name.lower()
+        if 'machina' in name_lower or 'coating' in name_lower or 'rationalisation' in name_lower:
+            print(f"  PAUSED project with relevant terms: {project.id} - {project.name}")
+            existing = next((c for c in candidates if c['project_id'] == project.id), None)
+            if not existing:
+                candidates.append({
+                    'project_id': project.id,
+                    'project_name': project.name,
+                    'match_score': 0.5  # Base score for paused + relevant terms
+                })
+
+print(f"Total paused projects: {len(paused_projects)}")
+
+print("\n=== Step 8: Load full project details for top candidates ===")
+# For candidates with highest scores, load full details to check description
+if candidates:
+    # Sort by match score descending
+    candidates.sort(key=lambda x: x['match_score'], reverse=True)
+    print(f"\nTop {min(5, len(candidates))} candidates by match score:")
+    for i, cand in enumerate(candidates[:5]):
+        print(f"  {i+1}. Score {cand['match_score']:.2f}: {cand['project_id']} - '{cand['project_name']}'")
+        
+        # Get full project to check description and customer
+        full_project = get_project(cand['project_id'])
+        if full_project:
+            print(f"     Customer ID: {full_project.customer}")
+            print(f"     Status: {full_project.status}")
+            # Check if customer is Machina Press Systems
+            if full_project.customer in customer_ids:
+                print(f"     *** Customer matches Machina Press Systems ***")
+                # Boost score
+                cand['match_score'] = min(1.0, cand['match_score'] + 0.2)
+            
+            # Check description for relevant terms
+            if full_project.description:
+                desc_lower = full_project.description.lower()
+                if 'coating' in desc_lower:
+                    print(f"     Description contains 'coating'")
+                if 'rationalisation' in desc_lower or 'rationalization' in desc_lower:
+                    print(f"     Description contains 'rationalisation/rationalization'")
+                if 'machina' in desc_lower:
+                    print(f"     Description contains 'machina'")
+else:
+    print("No candidates found yet, checking all projects for any relevance...")
+    # Last resort: check all projects for any relevance
+    for project in all_projects:
+        name_lower = project.name.lower()
+        # Very loose match: contains any of the keywords
+        if 'coating' in name_lower or 'rationalisation' in name_lower or 'rationalization' in name_lower or 'machina' in name_lower:
+            score = 0.3  # Low score for loose match
+            candidates.append({
+                'project_id': project.id,
+                'project_name': project.name,
+                'match_score': score
+            })
+
+print("\n=== Final candidates ===")
+# Final sort and deduplicate
+unique_candidates = []
+seen_ids = set()
+for cand in candidates:
+    if cand['project_id'] not in seen_ids:
+        seen_ids.add(cand['project_id'])
+        unique_candidates.append(cand)
+
+# Sort by score
+unique_candidates.sort(key=lambda x: x['match_score'], reverse=True)
+
+print(f"Found {len(unique_candidates)} unique candidate projects:")
+for i, cand in enumerate(unique_candidates):
+    print(f"  {i+1}. ID: {cand['project_id']}, Name: '{cand['project_name']}', Score: {cand['match_score']:.2f}")
+
+# Prepare output
+candidate_list = []
+for cand in unique_candidates:
+    candidate_list.append({
+        'project_id': cand['project_id'],
+        'project_name': cand['project_name'],
+        'match_score': round(cand['match_score'], 2)
+    })
+
+print(f"\nTotal candidate count: {len(candidate_list)}")
+```
+--------------------------------------------------------------------------------
+[USER] (message 3)
+--------------------------------------------------------------------------------
+Code execution result:
+STDOUT:
+Current user: 6KR2_024, Department: Sales & Customer Success, Location: Paris Office – France
+Today: 2025-04-03
+
+=== Step 1: Searching for customer 'Machina Press Systems' ===
+Found 1 customers matching 'Machina Press Systems':
+  - ID: cust_machina_press, Name: Machina Press Systems, Location: Italy, Deal Phase: active
+  Exact substring match: cust_machina_press - Machina Press Systems
+
+Total customers with 'machina' in name: 1
+
+=== Step 2: Direct project search with query strings ===
+
+Searching projects with query: 'coating rationalisation project for Machina Press Systems'
+  Found 0 projects
+
+Searching projects with query: 'coating rationalisation'
+  Found 1 projects
+  - proj_machina_press_line_rationalisation: Press line coating rationalisation (Customer: cust_machina_press)
+
+Searching projects with query: 'coating rationalization'
+  Found 0 projects
+
+Searching projects with query: 'Machina Press Systems'
+  Found 1 projects
+  - proj_machina_press_quick_clean: Quick-clean primer for machinery line (Customer: cust_machina_press)
+
+Searching projects with query: 'coating'
+  Found 5 projects
+  - proj_ferro_rail_bogie_anticorrosion: HV anti-corrosion system for rail bogies (Customer: cust_ferro_rail)
+  - proj_ferro_rail_infra_masts: Signal mast & infrastructure coating upgrade (Customer: cust_ferro_rail)
+  - proj_machina_press_high_temp: High-temperature coating for presses (Customer: cust_machina_press)
+  - proj_euro_flooring_warehouse_system: Warehouse floor coating system (Customer: cust_euro_flooring)
+  - proj_euro_flooring_low_voc_upgrade: Low-VOC floor system upgrade (Customer: cust_euro_flooring)
+
+Searching projects with query: 'rationalisation'
+  Found 1 projects
+  - proj_machina_press_line_rationalisation: Press line coating rationalisation (Customer: cust_machina_press)
+
+Searching projects with query: 'machina'
+  Found 2 projects
+  - proj_machina_press_quick_clean: Quick-clean primer for machinery line (Customer: cust_machina_press)
+  - proj_machina_press_line_rationalisation: Press line coating rationalisation (Customer: cust_machina_press)
+
+=== Step 3: Search projects by customer ID ===
+
+Searching projects for customer ID: cust_machina_press
+  Found 3 projects
+  - proj_machina_press_high_temp: High-temperature coating for presses (Status: active)
+  - proj_machina_press_quick_clean: Quick-clean primer for machinery line (Status: exploring)
+  - proj_machina_press_line_rationalisation: Press line coating rationalisation (Status: paused)
+    *** PAUSED PROJECT ***
+
+=== Step 4: Get all projects for fuzzy matching ===
+Total projects in system: 36
+
+=== Step 5: Fuzzy matching on project names ===
+
+Fuzzy matching target: 'coating rationalisation project for Machina Press Systems'
+  Match score 0.51: proj_machina_press_line_rationalisation - 'Press line coating rationalisation'
+  Match score 0.46: proj_nordport_ramp_flooring - 'Loading ramp and dock floor system'
+  Match score 0.43: proj_machina_press_quick_clean - 'Quick-clean primer for machinery line'
+
+Fuzzy matching target: 'coating rationalisation'
+  Match score 0.81: proj_machina_press_line_rationalisation - 'Press line coating rationalisation'
+  Match score 0.45: proj_balkanmetal_workshop_standards - 'Workshop coating standards and training'
+  Match score 0.43: proj_visegrad_multi_substrate_system - 'Multi-substrate coating portfolio'
+  Match score 0.42: proj_rnd_low_voc_platform_bellini - 'R&D – Low-VOC formulation platform'
+  Match score 0.41: proj_adriatic_port_crane_repaint - 'Port crane repainting specification'
+
+Fuzzy matching target: 'coating rationalization'
+  Match score 0.77: proj_machina_press_line_rationalisation - 'Press line coating rationalisation'
+  Match score 0.45: proj_balkanmetal_workshop_standards - 'Workshop coating standards and training'
+  Match score 0.43: proj_visegrad_multi_substrate_system - 'Multi-substrate coating portfolio'
+  Match score 0.42: proj_rnd_low_voc_platform_bellini - 'R&D – Low-VOC formulation platform'
+  Match score 0.41: proj_adriatic_port_crane_repaint - 'Port crane repainting specification'
+
+Fuzzy matching target: 'Machina Press Systems'
+  Match score 0.47: proj_nordport_ramp_flooring - 'Loading ramp and dock floor system'
+  Match score 0.44: proj_iberia_structural_steel - 'Structural steel protection system'
+  Match score 0.43: proj_euro_flooring_warehouse_system - 'Warehouse floor coating system'
+  Match score 0.43: proj_balkanrail_bogie_component_system - 'Bogie component coating system'
+  Match score 0.41: proj_alpinerail_depot_refurb - 'Depot steel refurbishment system'
+
+Fuzzy matching target: 'coating rationalisation machina'
+  Match score 0.71: proj_machina_press_line_rationalisation - 'Press line coating rationalisation'
+  Match score 0.46: proj_balkanmetal_zinc_rich_primer - 'Zinc-rich primer trial for fabrication line'
+
+Fuzzy matching target: 'machina press coating'
+  Match score 0.49: proj_rhinemach_machinery_primer - 'High-build machinery primer optimisation'
+  Match score 0.47: proj_machina_press_line_rationalisation - 'Press line coating rationalisation'
+  Match score 0.47: proj_euro_flooring_warehouse_system - 'Warehouse floor coating system'
+  Match score 0.46: proj_ferro_rail_infra_masts - 'Signal mast & infrastructure coating upgrade'
+  Match score 0.46: proj_machina_press_high_temp - 'High-temperature coating for presses'
+
+=== Step 6: Check project descriptions ===
+  Found project with both 'coating' and 'rationalisation': proj_machina_press_line_rationalisation - Press line coating rationalisation
+
+Projects with 'coating' in name: 10
+Projects with 'rationalisation/rationalization' in name: 1
+Projects with 'machina' in name: 0
+
+=== Step 7: Check for paused projects ===
+  PAUSED project with relevant terms: proj_machina_press_line_rationalisation - Press line coating rationalisation
+Total paused projects: 1
+
+=== Step 8: Load full project details for top candidates ===
+
+Top 5 candidates by match score:
+  1. Score 0.51: proj_machina_press_line_rationalisation - 'Press line coating rationalisation'
+     Customer ID: cust_machina_press
+     Status: paused
+     *** Customer matches Machina Press Systems ***
+     Description contains 'coating'
+     Description contains 'rationalisation/rationalization'
+     Description contains 'machina'
+  2. Score 0.49: proj_rhinemach_machinery_primer - 'High-build machinery primer optimisation'
+     Customer ID: cust_rhinemach_industrial
+     Status: active
+  3. Score 0.46: proj_nordport_ramp_flooring - 'Loading ramp and dock floor system'
+     Customer ID: cust_nordport_logistics
+     Status: exploring
+  4. Score 0.46: proj_ferro_rail_infra_masts - 'Signal mast & infrastructure coating upgrade'
+     Customer ID: cust_ferro_rail
+     Status: exploring
+  5. Score 0.46: proj_balkanmetal_zinc_rich_primer - 'Zinc-rich primer trial for fabrication line'
+     Customer ID: cust_balkanmetal_fabrication
+     Status: exploring
+
+=== Final candidates ===
+Found 15 unique candidate projects:
+  1. ID: proj_machina_press_line_rationalisation, Name: 'Press line coating rationalisation', Score: 0.71
+  2. ID: proj_rhinemach_machinery_primer, Name: 'High-build machinery primer optimisation', Score: 0.49
+  3. ID: proj_nordport_ramp_flooring, Name: 'Loading ramp and dock floor system', Score: 0.46
+  4. ID: proj_ferro_rail_infra_masts, Name: 'Signal mast & infrastructure coating upgrade', Score: 0.46
+  5. ID: proj_balkanmetal_zinc_rich_primer, Name: 'Zinc-rich primer trial for fabrication line', Score: 0.46
+  6. ID: proj_machina_press_high_temp, Name: 'High-temperature coating for presses', Score: 0.46
+  7. ID: proj_balkanmetal_workshop_standards, Name: 'Workshop coating standards and training', Score: 0.45
+  8. ID: proj_iberia_structural_steel, Name: 'Structural steel protection system', Score: 0.44
+  9. ID: proj_euro_flooring_warehouse_system, Name: 'Warehouse floor coating system', Score: 0.43
+  10. ID: proj_balkanrail_bogie_component_system, Name: 'Bogie component coating system', Score: 0.43
+  11. ID: proj_visegrad_multi_substrate_system, Name: 'Multi-substrate coating portfolio', Score: 0.43
+  12. ID: proj_machina_press_quick_clean, Name: 'Quick-clean primer for machinery line', Score: 0.43
+  13. ID: proj_rnd_low_voc_platform_bellini, Name: 'R&D – Low-VOC formulation platform', Score: 0.42
+  14. ID: proj_alpinerail_depot_refurb, Name: 'Depot steel refurbishment system', Score: 0.41
+  15. ID: proj_adriatic_port_crane_repaint, Name: 'Port crane repainting specification', Score: 0.41
+
+Total candidate count: 15
+
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 4)
+--------------------------------------------------------------------------------
+Based on the comprehensive search results, I have successfully located candidate projects matching the description "coating rationalisation project for Machina Press Systems". The search followed a tiered strategy from exact matches to fuzzy matching, and identified one clear top candidate that matches all key criteria.
+
+<final_answer>
+I have completed Step 3 by executing a thorough tiered search strategy across all project records. The search progressed from exact matching to substring searches, customer-based filtering, and finally fuzzy matching on project names. 
+
+Key findings:
+1. Found 1 customer matching "Machina Press Systems" (ID: cust_machina_press)
+2. Identified 15 candidate projects through various search methods
+3. The top candidate strongly matches all criteria: it contains "coating rationalisation" in the name, is associated with customer "cust_machina_press" (Machina Press Systems), and has status "paused"
+4. This project "Press line coating rationalisation" (ID: proj_machina_press_line_rationalisation) appears to be the specific project record requested
+
+The fuzzy matching scores reflect the similarity between search terms and project names, with the top candidate achieving the highest score of 0.71.
+</final_answer>
+<json>
+{
+  "candidates": [
+    {"project_id": "proj_machina_press_line_rationalisation", "project_name": "Press line coating rationalisation", "match_score": 0.71},
+    {"project_id": "proj_rhinemach_machinery_primer", "project_name": "High-build machinery primer optimisation", "match_score": 0.49},
+    {"project_id": "proj_nordport_ramp_flooring", "project_name": "Loading ramp and dock floor system", "match_score": 0.46},
+    {"project_id": "proj_ferro_rail_infra_masts", "project_name": "Signal mast & infrastructure coating upgrade", "match_score": 0.46},
+    {"project_id": "proj_balkanmetal_zinc_rich_primer", "project_name": "Zinc-rich primer trial for fabrication line", "match_score": 0.46},
+    {"project_id": "proj_machina_press_high_temp", "project_name": "High-temperature coating for presses", "match_score": 0.46},
+    {"project_id": "proj_balkanmetal_workshop_standards", "project_name": "Workshop coating standards and training", "match_score": 0.45},
+    {"project_id": "proj_iberia_structural_steel", "project_name": "Structural steel protection system", "match_score": 0.44},
+    {"project_id": "proj_euro_flooring_warehouse_system", "project_name": "Warehouse floor coating system", "match_score": 0.43},
+    {"project_id": "proj_balkanrail_bogie_component_system", "project_name": "Bogie component coating system", "match_score": 0.43},
+    {"project_id": "proj_visegrad_multi_substrate_system", "project_name": "Multi-substrate coating portfolio", "match_score": 0.43},
+    {"project_id": "proj_machina_press_quick_clean", "project_name": "Quick-clean primer for machinery line", "match_score": 0.43},
+    {"project_id": "proj_rnd_low_voc_platform_bellini", "project_name": "R&D – Low-VOC formulation platform", "match_score": 0.42},
+    {"project_id": "proj_alpinerail_depot_refurb", "project_name": "Depot steel refurbishment system", "match_score": 0.41},
+    {"project_id": "proj_adriatic_port_crane_repaint", "project_name": "Port crane repainting specification", "match_score": 0.41}
+  ],
+  "candidate_count": 15
+}</json>
+--------------------------------------------------------------------------------
+[USER] (message 5)
+--------------------------------------------------------------------------------
+VERIFICATION: Before accepting this conclusion, please confirm:
+
+STEP TO ACCOMPLISH:
+Step 3: Locate the specific project record corresponding to the 'coating rationalisation project for Machina Press Systems' in the project table.
+Approach: Query the project table using a tiered search strategy. First attempt exact match filters on the name field for phrases like 'coating rationalisation project for Machina Press Systems' (normalized to lowercase and trimmed). If no exact match is found, progressively relax the criteria: (1) check if normalized substrings such as 'coating rationalisation', 'coating rationalization', and 'machina press systems' are contained in the project.name or project.description using lowercase, whitespace-stripped comparisons; (2) apply regular expressions or partial-word matches; (3) use FUZZY and SEMANTIC / LOGICAL matching to compare the query phrase against project.name and project.description, including tolerance for misspellings, swapped word order, and abbreviations. Return a list of candidate projects with their identifiers, names, and match scores, clearly indicating if zero, one, or multiple candidates were found.
+Expected Output: {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"object","properties":{"project_id":{"type":"string"},"project_name":{"type":"string"},"match_score":{"type":"number"}},"required":["project_id","project_name","match_score"]}},"candidate_count":{"type":"integer"}},"required":["candidates","candidate_count"]}
+
+CHECKLIST:
+- Did you execute the step instruction?
+- Is there any action you skipped or assumed?
+- Are all facts verified (not assumed)?
+
+JSON response MUST contain ONLY values that were explicitly printed/verified from function returns.
+- You did not use any make-up data or sensiable defaults. All facts should be derived from function returns.
+- If any object is not found - consider using fuzzy matching, partial matching, double checks, etc.
+- Consider applying semantic/logical matching, if term is ambiguous or unclear, or it is abbreviation.
+- If nesseary, consider getting the object's fields value to understand the object better (project status, employee role, custome location, etc.)
+
+update functions are STATE-CHANGING - YOU SHOULD CALL THEM ONLY ONCE!
+
+- if you change state of any object - include explicit full information about this in the <final_answer> section.
+
+If complete, repeat BOTH your <final_answer> AND <json> blocks.
+If something was missed, execute the missing action now.
+
+If you are sure about results - you do not need to verify again. Just provide the <final_answer> and <json> blocks.
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 6)
+--------------------------------------------------------------------------------
+<final_answer>
+I have completed Step 3 by executing the exact tiered search strategy as specified. All facts were verified from function returns without any assumptions or made-up data. The search followed this precise approach:
+
+1. **Exact match filters**: Searched for the full phrase "coating rationalisation project for Machina Press Systems" - returned 0 projects
+2. **Normalized substring checks**: 
+   - "coating rationalisation" in project.name: found 1 project (proj_machina_press_line_rationalisation)
+   - "coating rationalization" in project.name: found 0 projects  
+   - "machina press systems" in project.name: found 0 projects (but found in customer records)
+3. **Customer verification**: Found customer "Machina Press Systems" (cust_machina_press) and searched projects by customer ID
+4. **Fuzzy matching**: Applied fuzzy comparison of target phrases against all project names, generating match scores
+5. **Description verification**: For top candidates, loaded full project details to check descriptions
+6. **Status checking**: Verified project statuses, particularly looking for "paused" projects
+
+All 15 candidate projects and their match scores were derived directly from function returns. The top candidate (proj_machina_press_line_rationalisation) has the highest match score (0.71) and matches all key criteria: contains "coating rationalisation" in name, associated with customer "Machina Press Systems", and has status "paused".
+
+No state-changing operations were performed during this step.
+</final_answer>
+<json>
+{
+  "candidates": [
+    {"project_id": "proj_machina_press_line_rationalisation", "project_name": "Press line coating rationalisation", "match_score": 0.71},
+    {"project_id": "proj_rhinemach_machinery_primer", "project_name": "High-build machinery primer optimisation", "match_score": 0.49},
+    {"project_id": "proj_nordport_ramp_flooring", "project_name": "Loading ramp and dock floor system", "match_score": 0.46},
+    {"project_id": "proj_ferro_rail_infra_masts", "project_name": "Signal mast & infrastructure coating upgrade", "match_score": 0.46},
+    {"project_id": "proj_balkanmetal_zinc_rich_primer", "project_name": "Zinc-rich primer trial for fabrication line", "match_score": 0.46},
+    {"project_id": "proj_machina_press_high_temp", "project_name": "High-temperature coating for presses", "match_score": 0.46},
+    {"project_id": "proj_balkanmetal_workshop_standards", "project_name": "Workshop coating standards and training", "match_score": 0.45},
+    {"project_id": "proj_iberia_structural_steel", "project_name": "Structural steel protection system", "match_score": 0.44},
+    {"project_id": "proj_euro_flooring_warehouse_system", "project_name": "Warehouse floor coating system", "match_score": 0.43},
+    {"project_id": "proj_balkanrail_bogie_component_system", "project_name": "Bogie component coating system", "match_score": 0.43},
+    {"project_id": "proj_visegrad_multi_substrate_system", "project_name": "Multi-substrate coating portfolio", "match_score": 0.43},
+    {"project_id": "proj_machina_press_quick_clean", "project_name": "Quick-clean primer for machinery line", "match_score": 0.43},
+    {"project_id": "proj_rnd_low_voc_platform_bellini", "project_name": "R&D – Low-VOC formulation platform", "match_score": 0.42},
+    {"project_id": "proj_alpinerail_depot_refurb", "project_name": "Depot steel refurbishment system", "match_score": 0.41},
+    {"project_id": "proj_adriatic_port_crane_repaint", "project_name": "Port crane repainting specification", "match_score": 0.41}
+  ],
+  "candidate_count": 15
+}</json>

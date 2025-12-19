@@ -1,0 +1,3359 @@
+================================================================================
+STEP 1 - LLM CONVERSATION
+================================================================================
+Started: 2025-12-09 20:24:37
+
+--------------------------------------------------------------------------------
+[SYSTEM PROMPT]
+--------------------------------------------------------------------------------
+You are an assistant. You help user to complete one step in a task in a business system.
+
+# Company: Bellini Industria Vernici S.p.A.
+Locations: Headquarters & Italian Factory – Northern Italy (between Milan and Bergamo), Serbian Factory – near Novi Sad, northern Serbia, Munich Office – Germany, Paris Office – France, Rotterdam Office – Netherlands, Barcelona Office – Spain, Vienna Office – Austria
+Executives: Giulia Bellini, Matteo Bellini, Filip Novak
+
+## Company rules (you should strictly follow them)
+**IF NESSESARY TAKE ACTIONS TO COMPLY WITH THE COMPANY RULES BELOW**
+
+## Authenticated User Rules:
+- IF request.resource == EmployeeProfile AND access_via == 'chatbot' THEN
+  ALLOW_FIELDS_FOR_ALL_EMPLOYEES = {name, email, location, department, basic_role, context_relevant_subset_of(skills, wills)};
+  RETURN only ALLOW_FIELDS_FOR_ALL_EMPLOYEES UNLESS rule_for_confidential_fields_applies;
+- IF request.resource == EmployeeProfile AND requested_fields INTERSECT {salary, hr_notes} != Ø THEN
+  REQUIRE (user.system_roles CONTAINS 'HRAdmin') OR is_manager_of(user, target_employee) == true;
+  ELSE RETURN Outcome='denied_security' AND DO NOT reveal_presence_of_values(salary, hr_notes);
+- IF action IN {UpdateLocation, UpdateDepartment, UpdateSkills, UpdateWills, UpdateEmployeeNotes} THEN
+  REQUIRE backend_permission_check(user, target_employee, action) == ALLOW;
+  IF DENY THEN RETURN Outcome='denied_security';
+  // Typical policy: self can edit own skills/wills; HR/authorized managers may edit broader fields.
+- IF action IN {CreateCustomer, UpdateCustomer, ChangeDealPhase} ON CRM THEN
+  REQUIRE user.system_roles INTERSECT {'SalesUser','CustomerServiceUser','SalesManager','CRMAdmin'} != Ø;
+  ELSE RETURN Outcome='denied_security';
+  // Other roles may read CRM where allowed but must not mutate core customer records.
+- IF action IN {CreateProject, UpdateProjectCoreFields(Status, Description, LinkedCustomer, ProjectManager), ModifyTeamWorkload} THEN
+  REQUIRE user.id == project.project_manager OR user.system_roles INTERSECT {'DepartmentLeader','ProjectAdmin','ITAdmin'} != Ø;
+  ELSE RETURN Outcome='denied_security';
+- IF action == ModifyTimeEntry THEN
+  REQUIRE target_entry.employee_id == user.id OR user.system_roles CONTAINS 'TimesheetAdmin';
+  REQUIRE target_entry.status == 'draft';
+  IF target_entry.status IN {'submitted','approved','invoiced','voided'} THEN DENY and RETURN Outcome='denied_security'; // corrections must use dedicated correction workflow outside normal edit
+- IF user.is_project_lead_for(project_id) AND action == CreateOrEditTimeEntryForOtherEmployee THEN
+  ALLOW ONLY IF new_or_updated_entry.status == 'draft';
+  DENY IF action_attempts_status_change_to IN {'submitted','approved'} FOR other_employee;
+- IF action IN {AddSkill, UpdateSkillLevel, RemoveSkill, AddWill, UpdateWillLevel, RemoveWill} ON EmployeeProfile THEN
+  REQUIRE (user.id == target_employee.id) OR user.system_roles INTERSECT {'HRAdmin','Manager'} != Ø;
+  MAINTAIN representation AS alphabetically_sorted(SkillLevel.name);
+- IF query_type IN {SearchBySkill, ListReportsTo, FindExpertsByLocation} THEN
+  ALLOW returning lists of employees WITH FIELDS {name, location, department, relevant_skills/wills} ONLY;
+  NEVER include {salary, hr_notes, private_identifiers} in such list responses.
+
+## General Rules:
+- FOR EACH session/chatbot_request: REQUIRE user.employee_id != null; BIND user.department, user.location, user.system_roles FROM EmployeeRegistry; ALL authorization_decisions MUST use this bound identity (NO privilege escalation or role spoofing by the agent).
+- IF target_system == Wiki AND content_to_write CONTAINS sensitive_personal_data({individual_salaries, confidential_HR_notes}) THEN
+  DENY write_request; RETURN Outcome='denied_security'; // Enforce: 'Avoid storing sensitive information (e.g. individual salaries) in the wiki.'
+- ALL authorization MUST be derived from user.system_roles (e.g. 'SalesUser','R&DUser','HRAdmin','ITAdmin');
+AI_agent_credentials MUST NOT be used to perform actions beyond permissions of the acting user.employee_id; backend MUST enforce and audit 'changed_by' using the real user, not a shared bot identity.
+- IF a request is understood BUT authorization_check == DENY THEN
+  RETURN Outcome='denied_security' with a non-sensitive explanation;
+ELSE IF request_type_not_supported THEN
+  RETURN Outcome='none_unsupported';
+- IF data_type IN {customer, project, employee, time_entry} THEN
+  READ/WRITE MUST target its home_system IN {CRM, ProjectRegistry, EmployeeRegistry, TimeTracking};
+  DO NOT persist authoritative copies of such data into Wiki or ad-hoc stores; use Wiki only for process/guideline documentation.
+
+# Current Context
+Date: 2025-08-26
+Current actor: Authenticated user Bhwa_028
+User details: {"id": "Bhwa_028", "name": "Pieter van der Linden", "department": "Sales & Customer Success", "location": "Rotterdam Office \u2013 Netherlands"}
+
+## Rules:
+- you **strictly follow the step description**. Literally executing requried action.
+- you should use exact functions/api/services requested by the step description. Do not use alternative or similar functionality.
+- Do not use logical defaults or stub or sensible defaults. You shoud realy only on available functions return (see below).
+- if there is clearly no relevant functon or api to the task - abort the task with clear explanation. do not invent or create absent functionality.
+- use Available Classes and Available Functions strictly according to their signatures. Signatures are provided below.
+- if something is not clear or you could not complete the task - describe the problems in <final_answer> section
+- consider only facts, numbers, clear statements. Do not make assumptions.
+
+## Search Strategy (search for any objects)
+- **CRITICAL FOR PROJECTS:** When searching for projects by a term (e.g., "CV project"), check BOTH:
+  - project.name (contains term?)
+  - project.id (contains term?)
+  - Example: `if 'cv' in project.name.lower() or 'cv' in project.id.lower()`
+- search by exact fields (id, name, email, etc.). Always prefer **exact match** over fuzzy match, if possible.
+- IF NOT FOUND, TRY TO RELAX FILTERS BELOW
+- try check if string is contained in fields values (python ` in ` operator), always normolize the string to lowercase and remove whitespace before ` in  `
+- try searching by other field (id, name, second name, description, etc.) or in different fields combination. Try all available fields.
+- try to use part of word or regex
+- try fuzzy matching (fuzzy_compare, fuzzy_find_in_text, search_wiki_fuzzy) - always returns top N results, YOU interpret the ratios
+- try searching in different object's fileds (name, id, full_name, description, etc.)
+- try semantic matching, e.g. NLP (abbreviation) can relates to language projects etc.
+- as the last resort, list all objects and try to find the one you need
+- finally, may be the query itself is not correct fundamentaly, change approach or report searching issue
+- you should try hard to find requested object, **TRY DIFFERENT APPROACHES IF NECESSARY**
+
+## Permisson, policy, access restrictions rules to verify:
+- CRITICAL ACTIONS: DATA DELETION, ERASING, REMOVING - PERMISSION DENIED WITHOUT ANY EXCEPTIONS. Use immediately_abort flag to abort the task immediately.
+- salary/wages/payments - can be access by the emploee himself or executeve level. no other access allowed.
+- tasks from external User (not employee) - only clearly neutral tasks (only publicly available information is allowed to be shared, e.g. "what is the weather today?", "what is the capital of France?"). If external user request interal info - shedule abort task.
+- always shedule step to check permissions and access restrictions for current user (who_am_i())
+- some actions require appropriate postiion/role/grade of the User, e.g. 
+project teamlead - can log time for team members for his project, change project status, change project team
+executeves, CEO or similar - can access salary data, any project and client information. Executives can do any actions related to project operations.
+Shedule step to explicitly verify it.
+
+## You **should not** verify the the following:
+- project status (accept any)
+
+## Data Structures (use ATTRIBUTE access: obj.field)
+
+CRITICAL: Functions return Pydantic models. Use obj.field, NOT obj['field']
+- Correct: `employee.salary`, `project.id`, `ctx.current_user`
+- WRONG: `employee['salary']`, `project['id']`, `ctx['current_user']`
+
+**ALL types below are PRE-IMPORTED - use directly, NO import needed!**
+```
+EmployeeBrief: id, name, email, salary, location, department
+EmployeeFull: id, name, email, salary, notes, location, department, skills: list[SkillLevel], wills: list[SkillLevel]
+SkillLevel: name (str), level (int)  # e.g. SkillLevel(name='python', level=5)
+CustomerBrief: id, name, location, deal_phase, high_level_status
+CustomerFull: id, name, brief, location, deal_phase, high_level_status, account_manager, primary_contact_name, primary_contact_email
+ProjectBrief: id, name, customer, status
+ProjectFull: id, name, description, customer, status, team: list[TeamMember]
+TeamMember: employee, time_slice, role
+TimeEntry: id, employee, customer, project, date, hours, work_category, notes, billable, status
+TimeSummaryByProject: customer, project, total_hours, billable_hours, non_billable_hours, distinct_employees
+TimeSummaryByEmployee: employee, total_hours, billable_hours, non_billable_hours
+WhoAmI: current_user, is_public, location, department, today, wiki_sha1
+```
+
+Example creating TeamMember (no import needed):
+```python
+new_member = TeamMember(employee="mira_schaefer", time_slice=0.20, role="QA")
+# OR use dict: {"employee": "mira_schaefer", "time_slice": 0.20, "role": "QA"}
+```
+
+Example with list comprehension:
+```python
+projects, _ = search_projects(team_employee='felix_baum')
+project_ids = [p.id for p in projects]  # Correct: p.id
+# WRONG: [p['id'] for p in projects]  # TypeError: object is not subscriptable
+```
+
+Returns: get_* → object|None (check for None!). list_*/search_* → (list[object], next_offset).
+
+## Enums
+- **status/deal_phase**: idea | exploring | active | paused | archived
+- **time_entry.status**: draft | submitted | approved | invoiced | voided
+- **role**: Lead | Engineer | Designer | QA | Ops | Other
+- **billable filter**: "" | "billable" | "non_billable"
+
+## Available Functions
+
+### Context
+```python
+who_am_i() -> WhoAmI
+# Returns current user context. Check is_public for guest/authenticated.
+```
+
+### Employees
+```python
+list_employees(offset=0, limit=5) -> tuple[list[EmployeeBrief], int]
+# Returns (employees, next_offset). next_offset=-1 means no more. MAX limit=5.
+
+list_all_employees() -> list[EmployeeBrief]
+# Get ALL employees (auto-paginates).
+
+get_employee(employee_id: str) -> EmployeeFull | None
+# Get full details by ID. Returns None if not found.
+
+search_employees(query=None, location=None, department=None, skills=None, offset=0, limit=5) -> tuple[list[EmployeeBrief], int]
+# Search with filters. skills: list of dicts [{'name': 'python', 'min_level': 3}]
+# NOTE: search uses 'min_level', but SkillLevel objects use 'level'!
+```
+
+### Customers
+```python
+list_customers(offset=0, limit=5) -> tuple[list[CustomerBrief], int]
+list_all_customers() -> list[CustomerBrief]
+get_customer(customer_id: str) -> CustomerFull | None
+search_customers(query=None, deal_phase=None, account_managers=None, locations=None, offset=0, limit=5) -> tuple[list[CustomerBrief], int]
+```
+
+### Projects
+```python
+list_projects(offset=0, limit=5) -> tuple[list[ProjectBrief], int]
+list_all_projects() -> list[ProjectBrief]
+get_project(project_id: str) -> ProjectFull | None
+# Returns project with team list.
+
+search_projects(query=None, customer_id=None, status=None, team_employee=None, team_role=None, include_archived=False, offset=0, limit=5) -> tuple[list[ProjectBrief], int]
+# Filter by team membership: team_employee/team_role.
+```
+
+### Time Entries
+```python
+search_time_entries(employee=None, customer=None, project=None, date_from=None, date_to=None, work_category=None, billable="", status="", offset=0, limit=5) -> tuple[list[TimeEntry], int, dict]
+# Returns (entries, next_offset, totals). totals={total_hours, total_billable, total_non_billable}.
+
+get_time_entry(entry_id: str) -> TimeEntry | None
+
+log_time_entry(employee, date, hours, work_category, notes, billable, status, logged_by, customer=None, project=None) -> str
+# Create new entry. Returns entry ID.
+
+update_time_entry(entry_id, date, hours, work_category, notes, billable, status, changed_by) -> bool
+# Update entry. ALL fields required (full replace).
+
+time_summary_by_project(date_from, date_to, customers=None, projects=None, employees=None, billable="") -> list[TimeSummaryByProject]
+# Returns summaries grouped by project. TimeSummaryByProject: customer, project, total_hours, billable_hours, non_billable_hours, distinct_employees
+
+time_summary_by_employee(date_from, date_to, customers=None, projects=None, employees=None, billable="") -> list[TimeSummaryByEmployee]
+# Returns summaries grouped by employee. TimeSummaryByEmployee: employee, total_hours, billable_hours, non_billable_hours
+```
+
+### Wiki
+```python
+list_wiki() -> list[str]                      # List all wiki file paths
+load_wiki(file_path: str) -> str | None       # Load wiki content
+search_wiki(query_regex: str) -> list[dict]   # Returns [{path, linum, content}]
+update_wiki(file_path, content, changed_by=None) -> bool
+```
+
+### Fuzzy Matching (always returns top N - YOU interpret ratios!)
+```python
+fuzzy_compare(targets: list[str], candidates: list[str], top_n=5) -> list[dict]
+# Compare word lists. Returns [{target, candidate, ratio}] sorted by ratio.
+# Example: fuzzy_compare(["felix"], employee_names) → always returns best 5 matches
+
+fuzzy_find_in_text(targets: list[str], texts: list[str], top_n=10, context_chars=100) -> list[dict]
+# Find targets in large texts. Returns [{target, text_index, matched, ratio, position, context}].
+
+search_wiki_fuzzy(words: list[str], top_n=10, context_chars=100) -> list[dict]
+# Fuzzy search wiki. Returns [{path, word, matched, ratio, line_num, context}].
+```
+
+### Updates (ALWAYS FULL REPLACE - pass ALL fields!)
+```python
+update_employee_info(employee_id, notes=None, salary=None, skills=None, wills=None, location=None, department=None, changed_by=None) -> object | None
+# ⚠️ FULL REPLACE! Omitted fields get RESET.
+# ⚠️ skills/wills MUST be list of dicts, NOT SkillLevel objects!
+# Example:
+#   old = get_employee(id)
+#   skills_dicts = [{'name': s.name, 'level': s.level} for s in old.skills]
+#   wills_dicts = [{'name': w.name, 'level': w.level} for w in old.wills]
+#   update_employee_info(id, salary=new, notes=old.notes, skills=skills_dicts, 
+#      wills=wills_dicts, location=old.location, department=old.department)
+
+
+update_project_status(project_id, status, changed_by=None) -> bool
+# Change project status. Only project Lead can change.
+
+update_project_team(project_id, team: list, changed_by=None) -> bool
+# Replace project team. team accepts EITHER:
+#   - List of TeamMember objects: [TeamMember(employee="id", time_slice=0.5, role="QA")]
+#   - List of dicts: [{"employee": "id", "time_slice": 0.5, "role": "QA"}]
+# Example preserving existing + adding new member:
+#   project = get_project("proj_id")
+#   new_team = [TeamMember(employee=m.employee, time_slice=m.time_slice, role=m.role) for m in project.team]
+#   new_team.append(TeamMember(employee="new_emp", time_slice=0.20, role="QA"))
+#   update_project_team("proj_id", new_team, changed_by="user_id")
+```
+## IMPORTANT NOTE FOR UPDATE FUNCTIONS:
+- update functions are STATE-CHANGING - YOU SHOULD CALL THEM ONLY ONCE!
+- do not check them by calling update functions again.
+- if you change state of any object - include explicit full information about this in the <final_answer> section.
+
+## Key Constraints
+- **Pagination limit**: MAX 5 items per page
+- **Authorization**: Check who_am_i().is_public and .department for access control
+- **Lead-only actions**: Only project Lead can change project status
+- **Executive-only**: Only Executive Leadership can change salary
+- **UPDATES = FULL REPLACE**: Always GET first, then pass ALL fields to preserve them
+- **STATE-CHANGING OPS**: log_time_entry, update_* functions CANNOT be retried! Always print result immediately after calling.
+
+## Python Code Execution Rules:
+- you can write and execute python code to perform the task.
+- where **ATOMIC SMALL STEPS!**, make more iterations to see intermediate results and adjust the code accordingly
+- use **print** statements explicitly to see intermediate results and adjust the code accordingly
+
+## Function Explicit Returns:
+- ALWAYS print() actual data retrieved from function calls
+- NEVER invent/assume object IDs, names, or values
+- JSON response MUST contain ONLY values that were explicitly printed/verified from function returns
+- If code returns objects, print their actual fields before using them
+
+## **Execute Python code**:
+```python
+valid python code here
+DO NOT USE TRIPLE BACKTICKS INSIDE PYTHON CODE BLOCK (```)!
+```
+
+**Example: Logging time entry (always print results!)**:
+```python
+# Action 1: Get current user and date
+ctx = who_am_i()
+print(f"User: {ctx.current_user}, Today: {ctx.today}")
+
+# Action 2: Get project to find customer_id
+project = get_project("proj_example_id")
+print(f"Project: {project.name}, Customer: {project.customer}")
+
+# Action 3: Create time entry (STATE-CHANGING - cannot retry!)
+entry_id = log_time_entry(
+    employee=ctx.current_user,
+    date="2025-03-31",
+    hours=3,
+    work_category="Development",
+    notes="",
+    billable=True,
+    status="draft",
+    logged_by=ctx.current_user,
+    customer=project.customer,
+    project="proj_example_id"
+)
+# ALWAYS print result of state-changing operations immediately!
+print(f"Created time entry: {entry_id}")
+```
+
+## Response Format
+2. **Provide final answer with JSON output** (when step is complete):
+<final_answer>
+Your conclusion for this step
+</final_answer>
+
+<json>
+{"your": "valid JSON addressing expected_output"}
+</json>
+
+Note: JSON must be in <json>...</json> tags (NOT markdown code blocks).
+
+--------------------------------------------------------------------------------
+[USER] (message 1)
+--------------------------------------------------------------------------------
+## Current User Context (who_am_i) - **as an assistant you acting on behalf of this User**
+current_user: Bhwa_028
+department: Sales & Customer Success
+location: Rotterdam Office – Netherlands
+today date: 2025-08-26
+is_public: False
+
+## GLOBAL TASK (FOR REFERENCE ONLY, DO NOT SOLVE THIS TASK. YOU NEED TO SOLVE THE CURRENT STEP ONLY)
+**Task:** Which of my projects doesn't have somebody responsible for the quality assurance on the team?
+
+## >>> CURRENT STEP (FOCUS HERE) <<<
+This is the current step you need to execute. Focus on completing THIS step.
+
+Step 1: Understand what 'quality assurance' (QA) and 'somebody responsible for the quality assurance on the team' mean in the company context, including whether this maps to a specific team member role label (for example role = 'QA') or any other convention.
+Approach: Search the internal wiki_file table and any other available company documentation using FUZZY and SEMANTIC / LOGICAL matching for terms and abbreviations related to 'quality assurance', 'QA', 'QA responsible', 'QA owner', and 'project team roles'. Interpret possible abbreviations or slang (for example 'QA' vs 'quality assurance engineer') using semantic similarity. If multiple meanings are found, identify which specifically relate to project teams and responsibility for quality assurance. This step only reads documentation; it does not access or modify any project or employee data.
+Expected Output: {"type":"object","properties":{"qa_term_definitions":{"type":"array","items":{"type":"string"}},"qa_role_labels":{"type":"array","items":{"type":"string"}},"ambiguity_notes":{"type":"array","items":{"type":"string"}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["qa_term_definitions","qa_role_labels","source_paths"]}
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 2)
+--------------------------------------------------------------------------------
+I'll search the company wiki for information about quality assurance roles and responsibilities.
+
+```python
+# First, let's see what wiki files are available
+wiki_files = list_wiki()
+print("Available wiki files:", wiki_files)
+print()
+
+# Search for quality assurance related terms using fuzzy search
+target_words = [
+    "quality assurance",
+    "QA", 
+    "QA responsible",
+    "QA owner",
+    "project team roles",
+    "quality assurance engineer",
+    "QA engineer",
+    "quality assurance role",
+    "QA role",
+    "test",
+    "testing",
+    "quality control",
+    "QC"
+]
+
+# Use fuzzy search to find relevant wiki content
+search_results = search_wiki_fuzzy(words=target_words, top_n=20, context_chars=100)
+print(f"Found {len(search_results)} fuzzy search results")
+print()
+
+# Also use regex search for more precise matching
+print("Searching for regex patterns...")
+regex_patterns = [
+    r"quality.*assurance",
+    r"QA",
+    r"test.*engineer",
+    r"role.*QA",
+    r"team.*role",
+    r"project.*team",
+    r"responsib.*quality"
+]
+
+for pattern in regex_patterns:
+    regex_results = search_wiki(query_regex=pattern)
+    if regex_results:
+        print(f"Pattern '{pattern}' found {len(regex_results)} matches")
+        for result in regex_results[:3]:  # Show first 3
+            print(f"  File: {result['path']}, Line {result['linum']}: {result['content'][:80]}...")
+        print()
+
+# Load and examine key wiki files that might contain role definitions
+qa_term_definitions = []
+qa_role_labels = []
+ambiguity_notes = []
+source_paths = set()
+
+# Examine the search results in detail
+print("\nExamining fuzzy search results in detail:")
+for result in search_results:
+    print(f"\nFile: {result['path']}")
+    print(f"Matched word: {result['word']}")
+    print(f"Match ratio: {result['ratio']:.2f}")
+    print(f"Context: {result['context']}")
+    
+    # Track source paths
+    source_paths.add(result['path'])
+    
+    # Extract potential definitions and role labels
+    content_lower = result['context'].lower()
+    
+    # Look for definitions
+    if "quality assurance" in content_lower or "qa" in content_lower:
+        if "means" in content_lower or "defined as" in content_lower or "refers to" in content_lower:
+            qa_term_definitions.append(result['context'].strip())
+    
+    # Look for role labels
+    if "role" in content_lower or "position" in content_lower or "title" in content_lower:
+        if "qa" in content_lower or "quality" in content_lower or "test" in content_lower:
+            qa_role_labels.append(result['context'].strip())
+    
+    # Check for ambiguities
+    if "sometimes" in content_lower or "also known as" in content_lower or "abbreviation" in content_lower:
+        ambiguity_notes.append(result['context'].strip())
+
+# Also search for project documentation specifically
+print("\n\nSearching for project team documentation...")
+project_team_results = search_wiki(query_regex=r"project.*team.*structure|team.*member.*role")
+for result in project_team_results:
+    print(f"File: {result['path']}, Line {result['linum']}: {result['content'][:100]}")
+    source_paths.add(result['path'])
+    
+    # Load full file to see context
+    content = load_wiki(result['path'])
+    if content:
+        lines = content.split('\n')
+        for i, line in enumerate(lines[max(0, result['linum']-3):min(len(lines), result['linum']+3)]):
+            print(f"  {i}: {line}")
+    
+    # Check for QA in team structure
+    if content and ('QA' in content or 'quality' in content.lower()):
+        qa_role_labels.extend([line.strip() for line in content.split('\n') if 'QA' in line or 'quality' in line.lower()])
+
+# Remove duplicates while preserving order
+qa_term_definitions = list(dict.fromkeys(qa_term_definitions))
+qa_role_labels = list(dict.fromkeys(qa_role_labels))
+ambiguity_notes = list(dict.fromkeys(ambiguity_notes))
+source_paths = list(source_paths)
+
+print("\n\n=== SUMMARY ===")
+print(f"QA Term Definitions found: {len(qa_term_definitions)}")
+for defn in qa_term_definitions:
+    print(f"  - {defn}")
+
+print(f"\nQA Role Labels found: {len(qa_role_labels)}")
+for label in qa_role_labels:
+    print(f"  - {label}")
+
+print(f"\nAmbiguity Notes found: {len(ambiguity_notes)}")
+for note in ambiguity_notes:
+    print(f"  - {note}")
+
+print(f"\nSource paths: {source_paths}")
+```
+
+--------------------------------------------------------------------------------
+[USER] (message 3)
+--------------------------------------------------------------------------------
+Code execution result:
+STDOUT:
+Available wiki files: ['business/marketing_and_sales_approach.md', 'business/markets_and_customers.md', 'company/history.md', 'company/locations_and_sites.md', 'company/mission_vision_values.md', 'company/organization_and_hierarchy.md', 'company/overview.md', 'hr/example_employee_profiles.md', 'hr/people_and_roles.md', 'hr/skills_and_wills_model.md', 'index.md', 'operations/factories_and_production.md', 'systems/chatbot_interface.md', 'systems/crm.md', 'systems/employee_registry.md', 'systems/knowledge_base.md', 'systems/overview.md', 'systems/project_registry.md', 'systems/time_tracking_and_reporting.md']
+
+Found 260 fuzzy search results
+
+Searching for regex patterns...
+Pattern 'QA' found 5 matches
+  File: company/history.md, Line 19: ## 1980–2000: Systems, quality and the Bellini brand
+
+- **1980s – Quality system...
+  File: hr/example_employee_profiles.md, Line 93: - Leads a shift team of operators (mixing, filling, packaging).
+- Ensures execut...
+  File: hr/people_and_roles.md, Line 53: - **Maintenance Technician**
+
+Production roles ensure safe, efficient execution ...
+
+Pattern 'role.*QA' found 3 matches
+  File: hr/people_and_roles.md, Line 53: - **Maintenance Technician**
+
+Production roles ensure safe, efficient execution ...
+  File: systems/project_registry.md, Line 37: - Team and workloads:
+  - Which employees are assigned
+  - Their role (Lead, Eng...
+  File: systems/project_registry.md, Line 68: * `Employee` – the employee ID
+* `TimeSlice` – the fraction of a full-time equiv...
+
+Pattern 'team.*role' found 1 matches
+  File: hr/example_employee_profiles.md, Line 72: - Interest in attending international conferences – 9  
+- Desire for more face‑t...
+
+Pattern 'project.*team' found 4 matches
+  File: business/marketing_and_sales_approach.md, Line 50: 3. **Project creation**
+   - A **project** is created in the project registry fo...
+  File: systems/chatbot_interface.md, Line 15: - Perform selected actions (depending on permissions):
+  - Update employee info ...
+  File: systems/project_registry.md, Line 64: ## Workload
+
+Employee workload in Bellini Coatings is determined by analysing **...
+
+
+Examining fuzzy search results in detail:
+
+File: company/history.md
+Matched word: QA
+Match ratio: 1.00
+Context: uses.
+
+## 1980–2000: Systems, quality and the Bellini brand
+
+- **1980s – Quality systems.** Formal QA and HSE practices are introduced. The “Bellini Coatings” brand is established for export markets.
+-
+
+File: hr/example_employee_profiles.md
+Matched word: QA
+Match ratio: 1.00
+Context: kaging).
+- Ensures execution of production orders according to recipes and SOPs.
+- Coordinates with QA and warehouse on deviations and urgent orders.
+
+### Skills (1–10)
+
+- Batch process management – 8
+
+File: hr/people_and_roles.md
+Matched word: QA
+Match ratio: 1.00
+Context: nance Technician**
+
+Production roles ensure safe, efficient execution of recipes and cooperate with QA and logistics.
+
+### Logistics & Supply Chain
+
+- **Logistics & Supply Chain Manager**
+- **Planner /
+
+File: hr/people_and_roles.md
+Matched word: QA
+Match ratio: 1.00
+Context: coordinates deliveries.
+
+### Quality & HSE
+
+- **Quality & HSE Manager**
+- **Quality Engineer**
+- **QA Technician**
+- **HSE Specialist**
+
+They define quality standards, run audits, manage complaints and
+
+File: operations/factories_and_production.md
+Matched word: QA
+Match ratio: 1.00
+Context: e team
+
+- **On‑site support functions**
+  - R&D labs (co‑located but reporting to R&D Director)
+  - QA laboratory (reports to Quality & HSE)
+  - Scheduling and planning (reports to Logistics & Supply Ch
+
+File: operations/factories_and_production.md
+Matched word: QA
+Match ratio: 1.00
+Context: s.
+
+### Organisation
+
+- **Plant Manager Serbia**
+  - Production supervisors (shift‑based)
+  - Local QA technicians
+  - Warehouse and loading team
+
+Serbian production follows the same **recipes, specific
+
+File: systems/project_registry.md
+Matched word: QA
+Match ratio: 1.00
+Context: D)
+- Team and workloads:
+  - Which employees are assigned
+  - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+  - Their approximate time slice (fraction of an FTE)
+
+## Why the project registry mat
+
+File: systems/project_registry.md
+Matched word: QA
+Match ratio: 1.00
+Context: o contribute to that project (e.g. 0.1, 0.3, 0.5, 1.0)
+* `Role` – the project role (Lead, Engineer, QA, Ops, Other)
+
+These allocations are defined and maintained in the **project registry**, which is th
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 1.00
+Context: e customer, the brief and the internal team (sales, R&D, application specialists).
+
+4. **Trials and testing**
+   - Lab work is performed by chemists.
+   - Field tests may be run on customer lines.
+   - Ti
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 1.00
+Context: ication specialists).
+
+4. **Trials and testing**
+   - Lab work is performed by chemists.
+   - Field tests may be run on customer lines.
+   - Time spent is logged against the project.
+
+5. **Offer & negotia
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 1.00
+Context: - **Technical buying criteria** (performance, durability, compliance).
+- **Long decision cycles** (testing, validation, approvals).
+- A desire for **stable supply and consistent quality** over many years
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 1.00
+Context: onsibilities
+
+- Develops and optimises solventborne coatings based on project briefs.
+- Designs lab tests and works with application specialists on field trials.
+- Documents approved systems and test prot
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 1.00
+Context: lab tests and works with application specialists on field trials.
+- Documents approved systems and test protocols in the wiki.
+
+### Skills (1–10)
+
+- Solventborne formulation – 9  
+- Corrosion resistance
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 1.00
+Context: protocols in the wiki.
+
+### Skills (1–10)
+
+- Solventborne formulation – 9  
+- Corrosion resistance testing – 8  
+- English language – 7  
+- Customer communication – 6  
+- Statistical analysis of experime
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 1.00
+Context: gates quality issues and customer complaints related to Serbian production.
+- Coordinates local lab tests and releases batches.
+- Maintains local SOPs and contributes to the central wiki for quality topic
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 1.00
+Context: ty topics.
+
+### Skills (1–10)
+
+- Quality management systems – 8  
+- Root cause analysis – 7  
+- Lab testing procedures – 7  
+- Serbian language – 10  
+- English language – 7  
+
+### Wills (1–10)
+
+- Interes
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 1.00
+Context: echnical Service Engineer**
+- **Regulatory & Compliance Specialist**
+
+They design formulations, run tests, document guidelines in the wiki and support customer trials.
+
+### Production – Italy / Serbia
+
+-
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 1.00
+Context: terests.
+- **Chatbot queries:**
+  - Employees can ask “Who in Serbia has strong skills in corrosion testing?” or “Who is interested in leading digitalisation projects?”.
+- **Workload and succession:**
+  -
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 1.00
+Context: any information (history, mission, organisation).
+- Market and customer insights.
+- R&D guidelines, test methods and application notes.
+- Production and quality procedures (at a conceptual level; detailed
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 1.00
+Context: is logged for support and technical visits.
+- **Internal R&D projects**
+  - Platform developments, testing programmes, regulatory updates.
+- **Internal process / IT projects**
+  - Improvements in product
+
+File: business/marketing_and_sales_approach.md
+Matched word: testing
+Match ratio: 1.00
+Context: e customer, the brief and the internal team (sales, R&D, application specialists).
+
+4. **Trials and testing**
+   - Lab work is performed by chemists.
+   - Field tests may be run on customer lines.
+   - Time
+
+File: business/markets_and_customers.md
+Matched word: testing
+Match ratio: 1.00
+Context: - **Technical buying criteria** (performance, durability, compliance).
+- **Long decision cycles** (testing, validation, approvals).
+- A desire for **stable supply and consistent quality** over many years.
+
+File: hr/example_employee_profiles.md
+Matched word: testing
+Match ratio: 1.00
+Context: protocols in the wiki.
+
+### Skills (1–10)
+
+- Solventborne formulation – 9  
+- Corrosion resistance testing – 8  
+- English language – 7  
+- Customer communication – 6  
+- Statistical analysis of experiments
+
+File: hr/example_employee_profiles.md
+Matched word: testing
+Match ratio: 1.00
+Context: ty topics.
+
+### Skills (1–10)
+
+- Quality management systems – 8  
+- Root cause analysis – 7  
+- Lab testing procedures – 7  
+- Serbian language – 10  
+- English language – 7  
+
+### Wills (1–10)
+
+- Interest i
+
+File: hr/skills_and_wills_model.md
+Matched word: testing
+Match ratio: 1.00
+Context: terests.
+- **Chatbot queries:**
+  - Employees can ask “Who in Serbia has strong skills in corrosion testing?” or “Who is interested in leading digitalisation projects?”.
+- **Workload and succession:**
+  - Co
+
+File: systems/project_registry.md
+Matched word: testing
+Match ratio: 1.00
+Context: is logged for support and technical visits.
+- **Internal R&D projects**
+  - Platform developments, testing programmes, regulatory updates.
+- **Internal process / IT projects**
+  - Improvements in production
+
+File: company/history.md
+Matched word: quality control
+Match ratio: 1.00
+Context: y.** A more modern plant is built on the outskirts of the town, with larger batch mixers and better quality control.
+- **1960s – First exports.** Bellini begins supplying customers in Switzerland and Germany, primar
+
+File: company/locations_and_sites.md
+Matched word: quality control
+Match ratio: 1.00
+Context: exity formulations
+  - Regional warehousing and distribution for Central & Eastern Europe
+  - Local quality control and batch release
+- **Rationale:**
+  - More competitive labour and energy costs.
+  - Closer to grow
+
+File: systems/chatbot_interface.md
+Matched word: project team roles
+Match ratio: 0.83
+Context: permissions):
+  - Update employee info (location, department, skills and wills, notes).
+  - Update project team or status.
+  - Create or update time entries.
+
+The chatbot returns a **message**, an **outcome** code and
+
+File: hr/example_employee_profiles.md
+Matched word: quality assurance
+Match ratio: 0.77
+Context: - **Reports to:** Quality & HSE Manager (Employee ID: E0172)
+
+### Responsibilities
+
+- Investigates quality issues and customer complaints related to Serbian production.
+- Coordinates local lab tests and releases batc
+
+File: operations/factories_and_production.md
+Matched word: quality assurance
+Match ratio: 0.77
+Context: nts.
+- Strong focus on **efficiency and cost competitiveness**.
+- Coordination with HQ on planning, quality issues and technical changes.
+
+## Production and systems
+
+Both plants rely on the central Progress‑based syst
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 0.75
+Context: hared via customer portals or email.
+
+- **Targeted outreach**
+  - Regional sales teams focus on clusters (e.g. machinery in southern Germany, rail around major hubs).
+  - Outreach is mostly via email, pho
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 0.75
+Context: ustomer added to CRM; a short **brief** is recorded.
+
+2. **Qualification**
+   - Account manager visits the site, sometimes with a technical sales engineer.
+   - Feasibility is evaluated: volumes, applicat
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 0.75
+Context: trategy and key account management.
+
+- **Regional Sales Managers**
+  - Lead sales in geographic clusters (Italy & Balkans, DACH, France/Benelux, Iberia).
+  - Manage account managers and coordinate with te
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 0.75
+Context: s in CRM and support account managers.
+
+## CRM usage principles
+
+Even though our CRM and project systems are built on **legacy technology**, they are the **single source of truth** for:
+
+- Customer master
+
+File: business/marketing_and_sales_approach.md
+Matched word: test
+Match ratio: 0.75
+Context: aster data.
+- Key contacts and roles.
+- Active and recent projects.
+- High‑level status of opportunities.
+
+Account managers are expected to keep **deal phases** and **briefs** reasonably up to date, and t
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: lini Coatings serves industrial customers across **Western and Central Europe**, with selected exports to the Balkans and neighbouring regions.
+
+## Primary market segments
+
+1. **Industrial machinery and e
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: ponents such as brackets, frames, chassis parts and accessories.
+   - Requirements for corrosion protection, stone‑chip resistance and visual quality.
+
+3. **Rail and public transport**
+   - Coatings for r
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: n food‑contact compliant or low‑VOC.
+
+5. **Industrial flooring and structural steel**
+   - Floor systems for warehouses, production halls and loading areas.
+   - Anti‑corrosion systems for beams, columns
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: eel**
+   - Floor systems for warehouses, production halls and loading areas.
+   - Anti‑corrosion systems for beams, columns and external structures.
+
+## Typical customers
+
+- Medium to large **OEMs** (Orig
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: e for plant construction and refurbishment.
+- Contractors specialised in industrial flooring and protective coatings.
+- Rail operators and their maintenance providers.
+
+Our customers generally have:
+
+- **
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: **Long decision cycles** (testing, validation, approvals).
+- A desire for **stable supply and consistent quality** over many years.
+
+## Customer lifecycle in our systems
+
+1. **Lead / idea**
+   - Customer
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: sire for **stable supply and consistent quality** over many years.
+
+## Customer lifecycle in our systems
+
+1. **Lead / idea**
+   - Customer contact identified (trade fair, referral, inbound request).
+   -
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: nbound request).
+   - Added to the CRM and represented as a `Company` record.
+   - Deal phase in systems: `idea`.
+
+2. **Exploring**
+   - First visits, basic technical discussions.
+   - Early lab suggestio
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: ns in CRM with a high‑level status (e.g. “Curious but cautious”, “Key account”, “Dormant”).
+
+Our systems use these phases mainly for **visibility and prioritisation**. The exact phase is maintained by the
+
+File: business/markets_and_customers.md
+Matched word: test
+Match ratio: 0.75
+Context: with a high‑level status (e.g. “Curious but cautious”, “Key account”, “Dormant”).
+
+Our systems use these phases mainly for **visibility and prioritisation**. The exact phase is maintained by the **accoun
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: , starts a small paint workshop in northern Italy. Early customers are local metal workshops, carpenters and agricultural equipment makers.
+- **1930s – First industrial customers.** The company begins sup
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: 1940s – War and reconstruction.** Operations are disrupted during WWII. Post‑war reconstruction creates strong demand for paints and coatings, and Bellini rebuilds and expands its facility.
+
+## 1950–1980:
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: 1970s – Technical specialisation.** The company invests in a small R&D lab, moving from generic paints to **application‑specific coatings**, especially for anti‑corrosion and high‑temperature uses.
+
+## 19
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: ion‑specific coatings**, especially for anti‑corrosion and high‑temperature uses.
+
+## 1980–2000: Systems, quality and the Bellini brand
+
+- **1980s – Quality systems.** Formal QA and HSE practices are intr
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: igh‑temperature uses.
+
+## 1980–2000: Systems, quality and the Bellini brand
+
+- **1980s – Quality systems.** Formal QA and HSE practices are introduced. The “Bellini Coatings” brand is established for expo
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: export markets.
+- **Early 1990s – IT era.** The company implements its first integrated business systems, built on **Progress OpenEdge**. These systems (CRM, project registry, time tracking, employee regi
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: ra.** The company implements its first integrated business systems, built on **Progress OpenEdge**. These systems (CRM, project registry, time tracking, employee registry) form the backbone still in use t
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: company implements its first integrated business systems, built on **Progress OpenEdge**. These systems (CRM, project registry, time tracking, employee registry) form the backbone still in use today.
+- *
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: – Incremental modernisation.** Reporting and some workflows are improved, but the core Progress systems remain largely unchanged. Employees become increasingly reliant on spreadsheets and email alongside
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: .
+- **2023 onwards – Chatbot initiative.** Rather than replacing the entire legacy stack, Bellini opts to **wrap existing systems with a chatbot interface**. The chatbot provides natural‑language access t
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: bot initiative.** Rather than replacing the entire legacy stack, Bellini opts to **wrap existing systems with a chatbot interface**. The chatbot provides natural‑language access to CRM, projects, time tra
+
+File: company/history.md
+Matched word: test
+Match ratio: 0.75
+Context: d perform routine actions.
+
+Bellini’s history is characterised by **pragmatic evolution**: careful steps that preserve stability and know‑how while gradually adopting new practices and technologies.
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: # Locations & Sites
+
+Bellini Coatings operates from **two main production sites** and several **small sales branches** a
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: # Locations & Sites
+
+Bellini Coatings operates from **two main production sites** and several **small sales branches** across Europe.
+
+## Headquart
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: # Locations & Sites
+
+Bellini Coatings operates from **two main production sites** and several **small sales branches** across Europe.
+
+## Headquarters & Italian Factory
+
+- **Locati
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: from **two main production sites** and several **small sales branches** across Europe.
+
+## Headquarters & Italian Factory
+
+- **Location:** Northern Italy, between Milan and Bergamo (industrial area on th
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: ; English, German and French are used with customers.
+- The site combines **office space, lab facilities and a production plant**, which encourages day‑to‑day collaboration between sales, R&D and operatio
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: ce** on average and slightly more modern infrastructure in parts of the plant, but most business systems are still accessed through the same central Progress environment.
+
+## Sales branches
+
+Bellini maint
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: ales manager, key account managers, technical sales engineer.
+
+- **Paris (France)**
+  - Focus: architectural metalwork, food processing, rail.
+  - Staff: account manager(s), technical sales or application
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: branches access the same **central CRM, project registry, employee registry and time tracking** systems via terminal or thin client, and rely heavily on email, Excel and the internal wiki.
+
+## Remote and
+
+File: company/locations_and_sites.md
+Matched word: test
+Match ratio: 0.75
+Context: on site with home office. Regardless of location, employees are expected to:
+
+- Use the central systems (CRM, project registry, time logging) as the **system of record**.
+- Keep their **location field**
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: Vision & Values
+
+## Mission
+
+To **develop and deliver reliable, high‑performance coatings** that protect and enhance industrial assets, combining Italian craftsmanship with technical expertise and long‑te
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: ip with technical expertise and long‑term partnership with our customers.
+
+In simple terms: **we protect what our customers build.**
+
+## Vision
+
+Bellini aims to be recognised in Europe as a **trusted spec
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: strial coatings, known for:
+
+- Tailored solutions that solve real‑world technical problems.
+- Consistent quality and on‑time delivery.
+- Close collaboration between customer teams, our salespeople and our
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: ## Core values
+
+1. **Craftsmanship**
+   - We care about details: formulation, application, colour, texture and long‑term performance.
+   - We treat our work as a craft, even when processes are industrial
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: iatives (such as the chatbot) focus on making everyday work simpler and decisions better informed.
+
+These values should be visible in **daily decisions**, not just in presentations: how we handle a custom
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: how we handle a customer complaint, how we record information, how we support colleagues in other sites, and how we use (or improve) our systems.
+
+File: company/mission_vision_values.md
+Matched word: test
+Match ratio: 0.75
+Context: we record information, how we support colleagues in other sites, and how we use (or improve) our systems.
+
+File: company/organization_and_hierarchy.md
+Matched word: test
+Match ratio: 0.75
+Context: rbia)
+  - Training & Development
+  - Payroll coordination
+
+- **IT & Digitalisation Manager**
+  - Systems Administration
+  - Progress OpenEdge specialist(s)
+  - Application Support
+  - Data & Reporting / B
+
+File: company/organization_and_hierarchy.md
+Matched word: test
+Match ratio: 0.75
+Context: * 8  
+- **IT & Digital:** 7  
+- **Human Resources (HR):** 6  
+- **Finance & Administration:** 12  
+
+These department names are used consistently in the **employee registry**, time tracking and other syste
+
+File: company/organization_and_hierarchy.md
+Matched word: test
+Match ratio: 0.75
+Context: n Resources (HR):** 6  
+- **Finance & Administration:** 12  
+
+These department names are used consistently in the **employee registry**, time tracking and other systems.
+
+## Reporting relationships
+
+Every
+
+File: company/organization_and_hierarchy.md
+Matched word: test
+Match ratio: 0.75
+Context: ese department names are used consistently in the **employee registry**, time tracking and other systems.
+
+## Reporting relationships
+
+Every employee in the employee registry has a single **direct manager
+
+File: company/organization_and_hierarchy.md
+Matched word: test
+Match ratio: 0.75
+Context: ips
+
+Every employee in the employee registry has a single **direct manager** recorded via the `reports_to` field (internally stored as an employee ID). This supports:
+
+- Organisational charts and headcoun
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: nded:** 1925
+- **Ownership:** 100% family owned (3rd and 4th generation Bellini family)
+- **Headquarters:** Northern Italy, in a small industrial town between Milan and Bergamo
+- **Employees:** ~150 acros
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: d commercial vehicle components**
+- **Rail and rolling stock**
+- **Food & beverage production facilities** (food‑contact compliant systems)
+- **Industrial flooring and structural steel**
+
+Typical product
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: - **Rail and rolling stock**
+- **Food & beverage production facilities** (food‑contact compliant systems)
+- **Industrial flooring and structural steel**
+
+Typical product families include:
+
+- High‑temperat
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: *
+
+Typical product families include:
+
+- High‑temperature resistant coatings (e.g. ovens, exhaust systems, engine components)
+- Anti‑corrosion systems (primers + intermediates + topcoats for steel structur
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: temperature resistant coatings (e.g. ovens, exhaust systems, engine components)
+- Anti‑corrosion systems (primers + intermediates + topcoats for steel structures)
+- Chemical‑resistant floor systems (often
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: ings (e.g. ovens, exhaust systems, engine components)
+- Anti‑corrosion systems (primers + intermediates + topcoats for steel structures)
+- Chemical‑resistant floor systems (often multi‑layer)
+- Hygienic a
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: ion systems (primers + intermediates + topcoats for steel structures)
+- Chemical‑resistant floor systems (often multi‑layer)
+- Hygienic and food‑safe coatings for tanks, pipes and process lines
+- Decorati
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: gs for tanks, pipes and process lines
+- Decorative but durable OEM topcoats with custom colours and textures
+
+## How we work with customers
+
+Bellini is not a “catalogue-only” paint vendor. For many key ac
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: h technical support.
+
+This project-centric way of working is deeply integrated with our internal systems (CRM, project registry, time tracking) and reflects how we think about value: **long‑term partnersh
+
+File: company/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: stern Europe** using the Serbian plant as a cost-effective base.
+- Modernise how we use data and systems, while **preserving the reliability** of our legacy Progress OpenEdge backbone.
+- Support more **su
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: lines, skills and wills are used in practice. Names and IDs here match the structure used in our systems.
+
+> Note: These examples are simplified and not exhaustive. For live data, use the employee registr
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: nd wills are used in practice. Names and IDs here match the structure used in our systems.
+
+> Note: These examples are simplified and not exhaustive. For live data, use the employee registry or the chatbo
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ales & Customer Success  
+- **Job title:** Senior Key Account Manager – Rail & Transport  
+- **Reports to:** Regional Sales Manager – DACH & Italy (Employee ID: E0078)
+
+### Responsibilities
+
+- Manages fou
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ort  
+- **Reports to:** Regional Sales Manager – DACH & Italy (Employee ID: E0078)
+
+### Responsibilities
+
+- Manages four major rail and rolling stock customers.
+- Owns revenue targets, pricing and contrac
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: l and rolling stock customers.
+- Owns revenue targets, pricing and contract negotiations.
+- Coordinates project creation and follow‑up with R&D and Technical Service.
+
+### Skills (1–10)
+
+- Customer relati
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: - 50–60% on **customer projects** (visits, calls, coordination).
+- 20–30% on **internal sales activities** (planning, reporting, fairs).
+- Remaining time on **admin and travel**.
+
+---
+
+## E0221 – Sara Rom
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: aining time on **admin and travel**.
+
+---
+
+## E0221 – Sara Romano (Senior Chemist – Solventborne Systems)
+
+- **Location:** HQ – Italy  
+- **Department:** R&D and Technical Service  
+- **Job title:** Senio
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: y  
+- **Department:** R&D and Technical Service  
+- **Job title:** Senior Chemist – Solventborne Systems  
+- **Reports to:** R&D Team Leader – Solventborne (Employee ID: E0199)
+
+### Responsibilities
+
+- De
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: nt:** R&D and Technical Service  
+- **Job title:** Senior Chemist – Solventborne Systems  
+- **Reports to:** R&D Team Leader – Solventborne (Employee ID: E0199)
+
+### Responsibilities
+
+- Develops and optim
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ne Systems  
+- **Reports to:** R&D Team Leader – Solventborne (Employee ID: E0199)
+
+### Responsibilities
+
+- Develops and optimises solventborne coatings based on project briefs.
+- Designs lab tests and wo
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: - Designs lab tests and works with application specialists on field trials.
+- Documents approved systems and test protocols in the wiki.
+
+### Skills (1–10)
+
+- Solventborne formulation – 9  
+- Corrosion re
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: - Corrosion resistance testing – 8  
+- English language – 7  
+- Customer communication – 6  
+- Statistical analysis of experiments – 6  
+- Progress system usage – 5  
+
+### Wills (1–10)
+
+- Interest in at
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: - **Department:** Production – Serbia  
+- **Job title:** Production Supervisor – Shift B  
+- **Reports to:** Plant Manager Serbia (Employee ID: E0310)
+
+### Responsibilities
+
+- Leads a shift team of operat
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: Supervisor – Shift B  
+- **Reports to:** Plant Manager Serbia (Employee ID: E0310)
+
+### Responsibilities
+
+- Leads a shift team of operators (mixing, filling, packaging).
+- Ensures execution of production
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ling, packaging).
+- Ensures execution of production orders according to recipes and SOPs.
+- Coordinates with QA and warehouse on deviations and urgent orders.
+
+### Skills (1–10)
+
+- Batch process managemen
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: – Italy  
+- **Department:** IT & Digital  
+- **Job title:** IT & Digitalisation Manager  
+- **Reports to:** CFO (functionally) and CEO (for strategic projects)
+
+### Responsibilities
+
+- Owns the overall I
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: on Manager  
+- **Reports to:** CFO (functionally) and CEO (for strategic projects)
+
+### Responsibilities
+
+- Owns the overall IT landscape, including the Progress OpenEdge systems.
+- Manages infrastructure
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: rojects)
+
+### Responsibilities
+
+- Owns the overall IT landscape, including the Progress OpenEdge systems.
+- Manages infrastructure, backups, user access and small integrations.
+- Leads digital initiatives
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: nd small integrations.
+- Leads digital initiatives, including the **chatbot wrapper** for legacy systems.
+
+### Skills (1–10)
+
+- Progress OpenEdge administration – 8  
+- Database querying & reporting – 8
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: Skills (1–10)
+
+- Progress OpenEdge administration – 8  
+- Database querying & reporting – 8  
+- Systems integration (APIs, middleware) – 7  
+- Project management – 7  
+- Change management – 6  
+- Busines
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: nge management – 6  
+- Business process mapping – 8  
+
+### Wills (1–10)
+
+- Desire to modernise architecture (APIs, cloud) – 10  
+- Interest in data analytics / BI – 9  
+- Willingness to champion new tools
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: rtment:** Human Resources (HR)  
+- **Job title:** HR Specialist – Development & Training  
+- **Reports to:** HR Director (Employee ID: E0150)
+
+### Responsibilities
+
+- Maintains employee records in the reg
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: list – Development & Training  
+- **Reports to:** HR Director (Employee ID: E0150)
+
+### Responsibilities
+
+- Maintains employee records in the registry, including skills and wills.
+- Coordinates training p
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: sponsibilities
+
+- Maintains employee records in the registry, including skills and wills.
+- Coordinates training programmes and language courses.
+- Supports managers in succession planning and performance
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: epartment:** Sales & Customer Success  
+- **Job title:** Technical Sales Engineer – DACH  
+- **Reports to:** Regional Sales Manager – DACH (Employee ID: E0079)
+
+### Responsibilities
+
+- Acts as a technical
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: neer – DACH  
+- **Reports to:** Regional Sales Manager – DACH (Employee ID: E0079)
+
+### Responsibilities
+
+- Acts as a technical bridge between German customers and R&D in Italy.
+- Supports field trials an
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: * Sales & Customer Success  
+- **Job title:** Customer Service / Inside Sales Specialist  
+- **Reports to:** Customer Service Team Lead (Employee ID: E0210)
+
+### Responsibilities
+
+- Enters and follows up
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: les Specialist  
+- **Reports to:** Customer Service Team Lead (Employee ID: E0210)
+
+### Responsibilities
+
+- Enters and follows up on customer orders.
+- Maintains basic CRM data (contacts, addresses, shipm
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: list  
+- **Reports to:** Customer Service Team Lead (Employee ID: E0210)
+
+### Responsibilities
+
+- Enters and follows up on customer orders.
+- Maintains basic CRM data (contacts, addresses, shipment prefer
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: basic CRM data (contacts, addresses, shipment preferences).
+- Handles routine queries on delivery dates, documentation and invoices.
+
+### Skills (1–10)
+
+- Order management – 8  
+- Communication via phone/
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: 0)
+
+- Interest in process automation and better tools – 7  
+- Interest in mentoring newcomers on systems – 6  
+
+---
+
+## E0302 – Ana Petrović (Quality Engineer – Serbia)
+
+- **Location:** Serbian Plant  
+-
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ian Plant  
+- **Department:** Quality & HSE  
+- **Job title:** Quality Engineer – Serbia  
+- **Reports to:** Quality & HSE Manager (Employee ID: E0172)
+
+### Responsibilities
+
+- Investigates quality issues
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: y Engineer – Serbia  
+- **Reports to:** Quality & HSE Manager (Employee ID: E0172)
+
+### Responsibilities
+
+- Investigates quality issues and customer complaints related to Serbian production.
+- Coordinates
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ia  
+- **Reports to:** Quality & HSE Manager (Employee ID: E0172)
+
+### Responsibilities
+
+- Investigates quality issues and customer complaints related to Serbian production.
+- Coordinates local lab tests
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: ies
+
+- Investigates quality issues and customer complaints related to Serbian production.
+- Coordinates local lab tests and releases batches.
+- Maintains local SOPs and contributes to the central wiki for
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: production.
+- Coordinates local lab tests and releases batches.
+- Maintains local SOPs and contributes to the central wiki for quality topics.
+
+### Skills (1–10)
+
+- Quality management systems – 8  
+- Roo
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: and contributes to the central wiki for quality topics.
+
+### Skills (1–10)
+
+- Quality management systems – 8  
+- Root cause analysis – 7  
+- Lab testing procedures – 7  
+- Serbian language – 10  
+- Englis
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: aly  
+- **Department:** Logistics & Supply Chain  
+- **Job title:** Supply Chain Planner  
+- **Reports to:** Logistics & Supply Chain Manager (Employee ID: E0140)
+
+### Responsibilities
+
+- Plans production
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: Planner  
+- **Reports to:** Logistics & Supply Chain Manager (Employee ID: E0140)
+
+### Responsibilities
+
+- Plans production across Italy and Serbia based on demand and capacity.
+- Coordinates with sales
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: esponsibilities
+
+- Plans production across Italy and Serbia based on demand and capacity.
+- Coordinates with sales on forecasts and with plants on constraints.
+- Uses time summaries and project data to un
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: lanning tools and automation – 9  
+- Interest in short‑term assignments at the Serbian plant – 7  
+
+These profiles illustrate how **departments, reporting lines, skills and wills** come together in our sy
+
+File: hr/example_employee_profiles.md
+Matched word: test
+Match ratio: 0.75
+Context: profiles illustrate how **departments, reporting lines, skills and wills** come together in our systems and help the chatbot answer people‑related questions.
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: , support and leadership roles.
+
+## Main departments
+
+The following department names are used consistently in the **employee registry**, time tracking and reporting:
+
+- **Corporate Leadership**
+- **Sales
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: nager (KAM)**
+- **Technical Sales / Application Specialist**
+- **Customer Service / Inside Sales**
+
+These roles own the **customer relationship**, manage opportunities in the CRM, and open projects for R&
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: **Customer Service / Inside Sales**
+
+These roles own the **customer relationship**, manage opportunities in the CRM, and open projects for R&D and technical support.
+
+### R&D and Technical Service
+
+- **R&
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: R&D and Technical Service
+
+- **R&D Director**
+- **Team Leaders (Solventborne, Waterborne, Floor Systems, etc.)**
+- **Senior Chemist / Chemist**
+- **Lab Technician**
+- **Application Specialist / Technical
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: pping / Receiving Clerk**
+
+This team balances capacity across plants, manages inventory and coordinates deliveries.
+
+### Quality & HSE
+
+- **Quality & HSE Manager**
+- **Quality Engineer**
+- **QA Technician
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: h safety and environmental regulations.
+
+### IT & Digital
+
+- **IT & Digitalisation Manager**
+- **Systems Administrator**
+- **Progress OpenEdge Specialist**
+- **Application Support Analyst**
+- **Data & Rep
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: t**
+- **Application Support Analyst**
+- **Data & Reporting / BI Analyst**
+
+IT keeps the **legacy systems** running and leads modernisation initiatives such as the chatbot and better reporting.
+
+### HR
+
+-
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: ecords, reporting and support for pricing and profitability analysis.
+
+## Reporting and responsibilities
+
+Each role comes with responsibilities for:
+
+- Keeping data up to date (e.g. CRM, project registry,
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: ng and profitability analysis.
+
+## Reporting and responsibilities
+
+Each role comes with responsibilities for:
+
+- Keeping data up to date (e.g. CRM, project registry, time tracking).
+- Supporting cross‑fun
+
+File: hr/people_and_roles.md
+Matched word: test
+Match ratio: 0.75
+Context: model is used in development discussions: employees and managers jointly maintain profiles to reflect strengths and ambitions.
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: emented in the **employee registry** and is accessible to HR, managers, the chatbot and selected systems.
+
+## Definitions
+
+- **Skill**
+  - A capability the employee has (e.g. “Solventborne formulation”, “
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: 10:** Exceptional – go‑to person / very strong drive.
+
+The maximum skill level configured in our systems is **10**.
+
+## Principles for keeping profiles up to date
+
+- **Employees and managers** update skil
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: systems is **10**.
+
+## Principles for keeping profiles up to date
+
+- **Employees and managers** update skills and wills during annual reviews and as needed after major changes (new responsibilities, train
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: ** update skills and wills during annual reviews and as needed after major changes (new responsibilities, training, relocations).
+- Employees are encouraged to update their skills and wills outside of rev
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: fter major changes (new responsibilities, training, relocations).
+- Employees are encouraged to update their skills and wills outside of reviews as well, as a part of **SkillWillReflect update**.
+- HR enc
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: flect reality, not wishful thinking.
+- Wills are particularly important for:
+  - Identifying candidates for **succession planning** and promotions.
+  - Finding volunteers for **projects**, pilots or train
+
+File: hr/skills_and_wills_model.md
+Matched word: test
+Match ratio: 0.75
+Context: and Sales leaders search for employees with specific skills above a threshold (e.g. “epoxy floor systems ≥ 7”).
+- **Career development:**
+  - Managers and HR use wills to propose training or role changes
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: e work as a company: who we are, what we make, how we are organised, and how to use our internal systems.
+
+The wiki is aimed at **all employees** – from production operators and lab chemists to salespeopl
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: internal systems.
+
+The wiki is aimed at **all employees** – from production operators and lab chemists to salespeople and managers. It is also the main source of context for our **internal chatbot**, whic
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: production operators and lab chemists to salespeople and managers. It is also the main source of context for our **internal chatbot**, which reads and searches these pages.
+
+---
+
+## Structure
+
+- **Company
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: agers. It is also the main source of context for our **internal chatbot**, which reads and searches these pages.
+
+---
+
+## Structure
+
+- **Company**
+  - [Overview](company/overview.md)
+  - [History](company
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: any/history.md)
+  - [Mission, Vision & Values](company/mission_vision_values.md)
+  - [Locations & Sites](company/locations_and_sites.md)
+  - [Organisation & Hierarchy](company/organization_and_hierarchy.m
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: Vision & Values](company/mission_vision_values.md)
+  - [Locations & Sites](company/locations_and_sites.md)
+  - [Organisation & Hierarchy](company/organization_and_hierarchy.md)
+- **Business & Markets**
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: /skills_and_wills_model.md)
+  - [Example Employee Profiles](hr/example_employee_profiles.md)
+- **Systems & Tools**
+  - [Systems Overview](systems/overview.md)
+  - [CRM – Customer and Deal Tracking](system
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: .md)
+  - [Example Employee Profiles](hr/example_employee_profiles.md)
+- **Systems & Tools**
+  - [Systems Overview](systems/overview.md)
+  - [CRM – Customer and Deal Tracking](systems/crm.md)
+  - [Project
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: Employee Profiles](hr/example_employee_profiles.md)
+- **Systems & Tools**
+  - [Systems Overview](systems/overview.md)
+  - [CRM – Customer and Deal Tracking](systems/crm.md)
+  - [Project Registry](systems/
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: ems & Tools**
+  - [Systems Overview](systems/overview.md)
+  - [CRM – Customer and Deal Tracking](systems/crm.md)
+  - [Project Registry](systems/project_registry.md)
+  - [Employee Registry](systems/employe
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: stems/overview.md)
+  - [CRM – Customer and Deal Tracking](systems/crm.md)
+  - [Project Registry](systems/project_registry.md)
+  - [Employee Registry](systems/employee_registry.md)
+  - [Time Tracking & Rep
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: ing](systems/crm.md)
+  - [Project Registry](systems/project_registry.md)
+  - [Employee Registry](systems/employee_registry.md)
+  - [Time Tracking & Reporting](systems/time_tracking_and_reporting.md)
+  - [
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: gistry.md)
+  - [Employee Registry](systems/employee_registry.md)
+  - [Time Tracking & Reporting](systems/time_tracking_and_reporting.md)
+  - [Knowledge Base / Wiki](systems/knowledge_base.md)
+  - [Chatbot
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: [Time Tracking & Reporting](systems/time_tracking_and_reporting.md)
+  - [Knowledge Base / Wiki](systems/knowledge_base.md)
+  - [Chatbot Interface](systems/chatbot_interface.md)
+
+---
+
+## How to use this w
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: and_reporting.md)
+  - [Knowledge Base / Wiki](systems/knowledge_base.md)
+  - [Chatbot Interface](systems/chatbot_interface.md)
+
+---
+
+## How to use this wiki
+
+1. **Start with the Company section** if you a
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: his wiki
+
+1. **Start with the Company section** if you are new to Bellini Coatings.
+2. Use the **Systems** pages whenever you are unsure where to store or find information.
+3. Browse the **Example Employe
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: ample Employee Profiles** to understand how skills, wills and departments are represented in our systems.
+4. When in doubt, **ask the chatbot** – it will search this wiki and our legacy systems and link y
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: in our systems.
+4. When in doubt, **ask the chatbot** – it will search this wiki and our legacy systems and link you to the most relevant articles.
+
+If you find outdated or missing information, please pr
+
+File: index.md
+Matched word: test
+Match ratio: 0.75
+Context: you to the most relevant articles.
+
+If you find outdated or missing information, please propose updates via your manager or the system owner listed on the relevant page.
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: # Factories & Production
+
+Bellini Coatings operates two main production sites: **Italy** (HQ) and **Serbia**. Together they provide flexibility, redunda
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: # Factories & Production
+
+Bellini Coatings operates two main production sites: **Italy** (HQ) and **Serbia**. Together they provide flexibility, redundancy and access to differen
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: mulations.
+- Smaller batch sizes with more frequent changeovers.
+- Production of critical intermediates and components for some systems.
+- Pilot and pre‑series batches for new developments.
+
+### Organisat
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: s with more frequent changeovers.
+- Production of critical intermediates and components for some systems.
+- Pilot and pre‑series batches for new developments.
+
+### Organisation
+
+- **Plant Manager Italy**
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: y**
+  - Production supervisors (multiple shifts)
+  - Maintenance
+  - Local warehouse team
+
+- **On‑site support functions**
+  - R&D labs (co‑located but reporting to R&D Director)
+  - QA laboratory (report
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: support functions**
+  - R&D labs (co‑located but reporting to R&D Director)
+  - QA laboratory (reports to Quality & HSE)
+  - Scheduling and planning (reports to Logistics & Supply Chain)
+
+### Key characte
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: ing to R&D Director)
+  - QA laboratory (reports to Quality & HSE)
+  - Scheduling and planning (reports to Logistics & Supply Chain)
+
+### Key characteristics
+
+- High mix of products and colours; strong emp
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: **.
+- Coordination with HQ on planning, quality issues and technical changes.
+
+## Production and systems
+
+Both plants rely on the central Progress‑based systems for:
+
+- **Production orders and recipes** (
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: nd technical changes.
+
+## Production and systems
+
+Both plants rely on the central Progress‑based systems for:
+
+- **Production orders and recipes** (derived from project outcomes and product master data).
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: ere appropriate.
+- Log their own time to give visibility into the effort required for support activities.
+- Use the internal wiki to access **application notes** and **standard operating procedures** for
+
+File: operations/factories_and_production.md
+Matched word: test
+Match ratio: 0.75
+Context: into the effort required for support activities.
+- Use the internal wiki to access **application notes** and **standard operating procedures** for production.
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: face
+
+The **chatbot** is a modern, conversational interface that sits on top of Bellini’s legacy systems (CRM, project registry, employee registry, time tracking and wiki). It allows employees to **ask qu
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: ons (depending on permissions):
+  - Update employee info (location, department, skills and wills, notes).
+  - Update project team or status.
+  - Create or update time entries.
+
+The chatbot returns a **mes
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: ocation, department, skills and wills, notes).
+  - Update project team or status.
+  - Create or update time entries.
+
+The chatbot returns a **message**, an **outcome** code and a set of **links** to relev
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: ies.
+
+The chatbot returns a **message**, an **outcome** code and a set of **links** to relevant entities.
+
+## Outcome codes
+
+Every response includes an `Outcome` value indicating what happened:
+
+- `ok_ans
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: eed to investigate.
+
+## Links
+
+Responses can include a list of **links** that point to specific entities:
+
+- `employee` – an employee in the employee registry.
+- `customer` – a company in the CRM.
+- `proj
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: le (by path).
+- `location` – a recognised location/site.
+- `skill_id` or `will_id` - skills/wills.
+
+These links allow user interfaces (e.g. chat frontend, dashboards) to present quick navigation and conte
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: ese links allow user interfaces (e.g. chat frontend, dashboards) to present quick navigation and context around the chatbot’s answer.
+
+## Examples of interactions
+
+- “Who is responsible for Customer Ferro
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: nswer` (if allowed) or `denied_security` (if policy requires HR approval).  
+  - Action: system updates employee location and emits an event.
+
+## Principles for chatbot usage
+
+- Treat the chatbot as a **h
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: , not as a replacement for human judgement.
+- Use it to:
+  - Discover information faster.
+  - Navigate systems without manual searches.
+  - Get explanations of processes and terminology.
+- If an answer se
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: as a replacement for human judgement.
+- Use it to:
+  - Discover information faster.
+  - Navigate systems without manual searches.
+  - Get explanations of processes and terminology.
+- If an answer seems wr
+
+File: systems/chatbot_interface.md
+Matched word: test
+Match ratio: 0.75
+Context: ni’s **pragmatic digitalisation strategy**: modern user experience on top of robust but old core systems.
+
+File: systems/crm.md
+Matched word: test
+Match ratio: 0.75
+Context: ost.
+  - `archived` – relationship closed or no realistic future business.
+- Optional descriptive notes and tags.
+
+## Who uses the CRM?
+
+- **Sales & Customer Success**
+  - Primary owners of customer recor
+
+File: systems/crm.md
+Matched word: test
+Match ratio: 0.75
+Context: er Success**
+  - Primary owners of customer records and deal phases.
+- **Customer Service**
+  - Updates contact details and practical information.
+- **Management and Finance**
+  - Use CRM data for pipelin
+
+File: systems/crm.md
+Matched word: test
+Match ratio: 0.75
+Context: eflect the true state of the commercial relationship, not wishful thinking.
+
+## Linking to other systems
+
+- **Project registry:**
+  - Projects always reference a **customer ID** from the CRM (unless inter
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: ternal unique identifier)
+- Full name
+- Auto‑generated email address
+- Salary (confidential)
+- Free‑text notes (HR/internal use)
+- Location (e.g. “HQ – Italy”, “Serbian Plant”, “Munich Office”)
+- Departme
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: unique identifier)
+- Full name
+- Auto‑generated email address
+- Salary (confidential)
+- Free‑text notes (HR/internal use)
+- Location (e.g. “HQ – Italy”, “Serbian Plant”, “Munich Office”)
+- Department (one
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: mail, location, department and basic role.
+  - Selected skill and will information, depending on context.
+- **Managers and HR:**
+  - Full profile, including notes and salary.
+- **IT & system processes:**
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: ll and will information, depending on context.
+- **Managers and HR:**
+  - Full profile, including notes and salary.
+- **IT & system processes:**
+  - Use employee IDs and department/location to enforce acc
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: d routing rules.
+
+Access is controlled by **system roles** and internal policies. The chatbot respects these rules and will not reveal confidential information (such as exact salaries) to unauthorised use
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: outing rules.
+
+Access is controlled by **system roles** and internal policies. The chatbot respects these rules and will not reveal confidential information (such as exact salaries) to unauthorised users.
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: es) to unauthorised users.
+
+## How data gets into the registry
+
+- When an employee is hired, HR creates a record with:
+  - Initial notes
+  - Location
+  - Department
+  - Salary
+  - Initial skills and wills
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: w data gets into the registry
+
+- When an employee is hired, HR creates a record with:
+  - Initial notes
+  - Location
+  - Department
+  - Salary
+  - Initial skills and wills
+- Updates happen through:
+  - HR
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: d with:
+  - Initial notes
+  - Location
+  - Department
+  - Salary
+  - Initial skills and wills
+- Updates happen through:
+  - HR changes (e.g. promotions, relocations, salary adjustments).
+  - Manager and e
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: gh:
+  - HR changes (e.g. promotions, relocations, salary adjustments).
+  - Manager and employee updates during reviews (skills and wills).
+  - System events (e.g. location updates based on site changes).
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: anager and employee updates during reviews (skills and wills).
+  - System events (e.g. location updates based on site changes).
+
+Each significant change is recorded with “changed by” information for audit
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: rs**
+  - Look up reporting lines, salary ranges (where allowed), and skill distributions.
+- **Project staffing**
+  - Find people with specific skills at certain levels (e.g. “epoxy floor systems ≥ 7”).
+-
+
+File: systems/employee_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: - **Project staffing**
+  - Find people with specific skills at certain levels (e.g. “epoxy floor systems ≥ 7”).
+- **Cross‑site collaboration**
+  - Identify experts in other locations or departments.
+- **C
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: i
+
+The **knowledge base** (this wiki) is the central place for **processes, guidelines, technical notes and reference information** at Bellini Coatings.
+
+## Purpose
+
+- Preserve and share **know‑how** acro
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: Document **approved solutions**, best practices and lessons learned.
+- Serve as a key source of context for the **chatbot**.
+
+## Content types
+
+Typical content includes:
+
+- Company information (history,
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: best practices and lessons learned.
+- Serve as a key source of context for the **chatbot**.
+
+## Content types
+
+Typical content includes:
+
+- Company information (history, mission, organisation).
+- Market
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: sons learned.
+- Serve as a key source of context for the **chatbot**.
+
+## Content types
+
+Typical content includes:
+
+- Company information (history, mission, organisation).
+- Market and customer insights.
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: on, organisation).
+- Market and customer insights.
+- R&D guidelines, test methods and application notes.
+- Production and quality procedures (at a conceptual level; detailed SOPs may be separate).
+- Syste
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: roduction and logistics concepts.
+- `hr/` – People, departments, skills and example profiles.
+- `systems/` – Systems overview and usage guidelines.
+
+This structure is reflected in file paths (e.g. `system
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: d logistics concepts.
+- `hr/` – People, departments, skills and example profiles.
+- `systems/` – Systems overview and usage guidelines.
+
+This structure is reflected in file paths (e.g. `systems/project_re
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: ems/` – Systems overview and usage guidelines.
+
+This structure is reflected in file paths (e.g. `systems/project_registry.md`).
+
+## Editing and ownership
+
+- Each section of the wiki has **content owners**
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: e.g. `systems/project_registry.md`).
+
+## Editing and ownership
+
+- Each section of the wiki has **content owners** (e.g. HR for HR pages, IT for systems pages, R&D for technical guidelines).
+- Updates are
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: g and ownership
+
+- Each section of the wiki has **content owners** (e.g. HR for HR pages, IT for systems pages, R&D for technical guidelines).
+- Updates are coordinated via these owners to ensure consiste
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: *content owners** (e.g. HR for HR pages, IT for systems pages, R&D for technical guidelines).
+- Updates are coordinated via these owners to ensure consistency (top execs have full control).
+- To delete a
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: HR for HR pages, IT for systems pages, R&D for technical guidelines).
+- Updates are coordinated via these owners to ensure consistency (top execs have full control).
+- To delete a page - zero out its cont
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: se owners to ensure consistency (top execs have full control).
+- To delete a page - zero out its content. To rename - transfer content to new location and zero out old page.
+- The IT & Digital team mainta
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: y (top execs have full control).
+- To delete a page - zero out its content. To rename - transfer content to new location and zero out old page.
+- The IT & Digital team maintains the **technical infrastruc
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: nd zero out old page.
+- The IT & Digital team maintains the **technical infrastructure** and integrates the wiki with the chatbot.
+
+## Relation to other systems
+
+- The wiki is **not** a replacement for tr
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: the **technical infrastructure** and integrates the wiki with the chatbot.
+
+## Relation to other systems
+
+- The wiki is **not** a replacement for transactional data (e.g. CRM entries, project records, tim
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: nal data (e.g. CRM entries, project records, time logs).
+- Instead, it documents:
+  - How to use systems.
+  - Why certain processes exist.
+  - What standards and best practices apply.
+
+The chatbot can sea
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: ime logs).
+- Instead, it documents:
+  - How to use systems.
+  - Why certain processes exist.
+  - What standards and best practices apply.
+
+The chatbot can search the wiki to answer “how” and “why” questio
+
+File: systems/knowledge_base.md
+Matched word: test
+Match ratio: 0.75
+Context: d and up to date**.
+- Use clear headings and bullet points.
+- Add **links** to related pages and systems where helpful.
+- Avoid storing sensitive information (e.g. individual salaries) in the wiki.
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: # Systems Overview
+
+Bellini Coatings runs its core business on a set of **legacy but robust systems** built o
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: # Systems Overview
+
+Bellini Coatings runs its core business on a set of **legacy but robust systems** built on **Progress OpenEdge** more than 30 years ago. These systems are centralised at HQ and ac
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: ss on a set of **legacy but robust systems** built on **Progress OpenEdge** more than 30 years ago. These systems are centralised at HQ and accessed from Italy, Serbia and all EU branches.
+
+The main syste
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: et of **legacy but robust systems** built on **Progress OpenEdge** more than 30 years ago. These systems are centralised at HQ and accessed from Italy, Serbia and all EU branches.
+
+The main systems visibl
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: ese systems are centralised at HQ and accessed from Italy, Serbia and all EU branches.
+
+The main systems visible to most employees are:
+
+- **CRM – Customer Relationship Management**
+- **Project Registry**
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: acking / Timesheets**
+- **Knowledge Base / Wiki**
+- **Chatbot Interface (new layer over existing systems)**
+
+## Design principles
+
+1. **Single source of truth**
+   - Each type of information has a “home”
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: omer data in CRM, people data in employee registry).
+2. **Stability over novelty**
+   - The core systems are old but extremely stable. We minimise risky changes.
+3. **Progressive modernisation**
+   - New
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: **Progressive modernisation**
+   - New initiatives (like the chatbot) sit **on top of** existing systems rather than replacing them immediately.
+
+## System roles and access
+
+Every employee with system acc
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: ds and is centrally managed by IT in coordination with HR and managers.
+
+## Relationship between systems
+
+At a high level:
+
+- The **CRM** stores customers and basic opportunities.
+- The **project registry
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: # Relationship between systems
+
+At a high level:
+
+- The **CRM** stores customers and basic opportunities.
+- The **project registry** tracks all major customer and internal projects.
+- The **employee regis
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: **time tracking** system records how employees spend their time across projects and internal activities.
+- The **wiki** stores process documentation, guidelines, case studies and reference material.
+- Th
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: documentation, guidelines, case studies and reference material.
+- The **chatbot** reads from and writes to these systems via APIs and uses the wiki for context and explanations.
+
+For detailed instructions
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: tation, guidelines, case studies and reference material.
+- The **chatbot** reads from and writes to these systems via APIs and uses the wiki for context and explanations.
+
+For detailed instructions on eac
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: uidelines, case studies and reference material.
+- The **chatbot** reads from and writes to these systems via APIs and uses the wiki for context and explanations.
+
+For detailed instructions on each system,
+
+File: systems/overview.md
+Matched word: test
+Match ratio: 0.75
+Context: aterial.
+- The **chatbot** reads from and writes to these systems via APIs and uses the wiki for context and explanations.
+
+For detailed instructions on each system, refer to the dedicated pages in this s
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: employees are assigned
+  - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+  - Their approximate time slice (fraction of an FTE)
+
+## Why the project registry matters
+
+- **Planning and workload**
+  -
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: , Ops, Other)
+  - Their approximate time slice (fraction of an FTE)
+
+## Why the project registry matters
+
+- **Planning and workload**
+  - Managers can see who is involved in which projects and at what int
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: s
+
+- **Planning and workload**
+  - Managers can see who is involved in which projects and at what intensity.
+- **Visibility**
+  - Sales, R&D, production and management can all see key projects and their s
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: l visits.
+- **Internal R&D projects**
+  - Platform developments, testing programmes, regulatory updates.
+- **Internal process / IT projects**
+  - Improvements in production, logistics, quality, HR, IT and
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: .
+
+## Workload
+
+Employee workload in Bellini Coatings is determined by analysing **their allocated FTE slices across all active projects**. Each project stores, as part of its team definition, a list of `
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: gs is determined by analysing **their allocated FTE slices across all active projects**. Each project stores, as part of its team definition, a list of `Workload` entries:
+
+* `Employee` – the employee ID
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: alysing **their allocated FTE slices across all active projects**. Each project stores, as part of its team definition, a list of `Workload` entries:
+
+* `Employee` – the employee ID
+* `TimeSlice` – the fr
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: `TimeSlice` – the fraction of a full-time equivalent (FTE) that the employee is expected to contribute to that project (e.g. 0.1, 0.3, 0.5, 1.0)
+* `Role` – the project role (Lead, Engineer, QA, Ops, Other
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: hat project (e.g. 0.1, 0.3, 0.5, 1.0)
+* `Role` – the project role (Lead, Engineer, QA, Ops, Other)
+
+These allocations are defined and maintained in the **project registry**, which is the system of record
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: oject B
+  * 0.2 FTE in Project C
+
+   then their planned workload totals **1.0 FTE**.
+
+3. **Sum all FTE slices** to determine the employee’s **aggregate planned workload**.
+   This provides a quick view of
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: igns with the project-centric way Bellini plans work: projects define who is involved and at what intensity.
+* It provides a **forward-looking view** of workload independent of time logs, which reflect pa
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: which reflect past activity.
+* It supports cross-department planning, since employees often contribute to multiple projects concurrently.
+
+### How the workload data is used
+
+* **Resource planning:** Depar
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: nt projects?” by directly aggregating `TimeSlice` values from the project registry.
+
+## Responsibilities
+
+- **Project manager:**
+  - Ensures the project is created correctly and linked to the right custom
+
+File: systems/project_registry.md
+Matched word: test
+Match ratio: 0.75
+Context: no) currently assigned to as Lead?”
+
+It does this by querying the project registry and linking results to employees and customers.
+
+File: systems/time_tracking_and_reporting.md
+Matched word: test
+Match ratio: 0.75
+Context: system** to understand how employees spend their time across customers, projects and internal activities.
+
+Most non‑production employees (and selected production roles) are required to log time regularly.
+
+File: systems/time_tracking_and_reporting.md
+Matched word: test
+Match ratio: 0.75
+Context: cimal, e.g. 1.0, 7.5)
+- Work category (e.g. `customer_project`, `internal`, `support`, `admin`)
+- Notes (short free text)
+- Billable flag (billable vs non‑billable)
+- Status:
+  - `draft`
+  - `submitted`
+
+File: systems/time_tracking_and_reporting.md
+Matched word: test
+Match ratio: 0.75
+Context: 7.5)
+- Work category (e.g. `customer_project`, `internal`, `support`, `admin`)
+- Notes (short free text)
+- Billable flag (billable vs non‑billable)
+- Status:
+  - `draft`
+  - `submitted`
+  - `approved`
+
+File: systems/time_tracking_and_reporting.md
+Matched word: test
+Match ratio: 0.75
+Context: ectations
+
+- Employees should log time **at least weekly**, ideally daily.
+- Use **projects** consistently:
+  - Customer work → customer projects.
+  - Internal initiatives → internal projects (e.g. “IT –
+
+File: systems/time_tracking_and_reporting.md
+Matched word: test
+Match ratio: 0.75
+Context: stomer projects.
+  - Internal initiatives → internal projects (e.g. “IT – Chatbot Pilot 2025”).
+- Notes should be concise but informative (what was done, not just “meeting”).
+- Project leads can log entri
+
+File: systems/time_tracking_and_reporting.md
+Matched word: test
+Match ratio: 0.75
+Context: employees.
+- **By employee**
+  - Total hours, distribution between customer work and internal activities.
+
+The chatbot can answer questions like:
+
+- “How many hours did we spend on Customer X last quarter
+
+File: systems/chatbot_interface.md
+Matched word: project team roles
+Match ratio: 0.72
+Context: actions.
+
+## What the chatbot can do
+
+- Answer questions about:
+  - Customers and their status.
+  - Projects, teams and workloads.
+  - Employees, departments, skills and locations.
+  - Time tracking summaries for emplo
+
+
+Searching for project team documentation...
+
+
+=== SUMMARY ===
+QA Term Definitions found: 0
+
+QA Role Labels found: 7
+  - nance Technician**
+
+Production roles ensure safe, efficient execution of recipes and cooperate with QA and logistics.
+
+### Logistics & Supply Chain
+
+- **Logistics & Supply Chain Manager**
+- **Planner /
+  - D)
+- Team and workloads:
+  - Which employees are assigned
+  - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+  - Their approximate time slice (fraction of an FTE)
+
+## Why the project registry mat
+  - o contribute to that project (e.g. 0.1, 0.3, 0.5, 1.0)
+* `Role` – the project role (Lead, Engineer, QA, Ops, Other)
+
+These allocations are defined and maintained in the **project registry**, which is th
+  - ian Plant  
+- **Department:** Quality & HSE  
+- **Job title:** Quality Engineer – Serbia  
+- **Reports to:** Quality & HSE Manager (Employee ID: E0172)
+
+### Responsibilities
+
+- Investigates quality issues
+  - employees are assigned
+  - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+  - Their approximate time slice (fraction of an FTE)
+
+## Why the project registry matters
+
+- **Planning and workload**
+  -
+  - `TimeSlice` – the fraction of a full-time equivalent (FTE) that the employee is expected to contribute to that project (e.g. 0.1, 0.3, 0.5, 1.0)
+* `Role` – the project role (Lead, Engineer, QA, Ops, Other
+  - hat project (e.g. 0.1, 0.3, 0.5, 1.0)
+* `Role` – the project role (Lead, Engineer, QA, Ops, Other)
+
+These allocations are defined and maintained in the **project registry**, which is the system of record
+
+Ambiguity Notes found: 1
+  - ustomer added to CRM; a short **brief** is recorded.
+
+2. **Qualification**
+   - Account manager visits the site, sometimes with a technical sales engineer.
+   - Feasibility is evaluated: volumes, applicat
+
+Source paths: ['company/organization_and_hierarchy.md', 'hr/people_and_roles.md', 'company/history.md', 'systems/crm.md', 'company/mission_vision_values.md', 'systems/project_registry.md', 'hr/example_employee_profiles.md', 'index.md', 'hr/skills_and_wills_model.md', 'systems/knowledge_base.md', 'company/overview.md', 'operations/factories_and_production.md', 'business/markets_and_customers.md', 'systems/chatbot_interface.md', 'business/marketing_and_sales_approach.md', 'systems/employee_registry.md', 'systems/time_tracking_and_reporting.md', 'systems/overview.md', 'company/locations_and_sites.md']
+
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 4)
+--------------------------------------------------------------------------------
+Based on my search of the company wiki documentation, I have identified how "quality assurance" (QA) is understood in the company context, particularly regarding project team roles. Here are the findings:
+
+<final_answer>
+I have analyzed the company wiki documentation to understand quality assurance roles and responsibilities. The search reveals that QA in project teams maps to a specific role label in the project registry system, with some additional context from job titles and departments.
+</final_answer>
+
+<json>
+{
+  "qa_term_definitions": [],
+  "qa_role_labels": ["QA", "QA Technician", "Quality Engineer"],
+  "ambiguity_notes": ["The term 'quality assurance' appears in multiple contexts: as a project role ('QA'), as job titles ('QA Technician', 'Quality Engineer'), and as a departmental function (Quality & HSE). For project team composition, the specific role label 'QA' is used in the project registry system alongside other roles like Lead, Engineer, Designer, Ops, and Other."],
+  "source_paths": ["systems/project_registry.md", "hr/people_and_roles.md", "hr/example_employee_profiles.md", "operations/factories_and_production.md", "company/history.md"]
+}</json>
+--------------------------------------------------------------------------------
+[USER] (message 5)
+--------------------------------------------------------------------------------
+VERIFICATION: Before accepting this conclusion, please confirm:
+
+STEP TO ACCOMPLISH:
+Step 1: Understand what 'quality assurance' (QA) and 'somebody responsible for the quality assurance on the team' mean in the company context, including whether this maps to a specific team member role label (for example role = 'QA') or any other convention.
+Approach: Search the internal wiki_file table and any other available company documentation using FUZZY and SEMANTIC / LOGICAL matching for terms and abbreviations related to 'quality assurance', 'QA', 'QA responsible', 'QA owner', and 'project team roles'. Interpret possible abbreviations or slang (for example 'QA' vs 'quality assurance engineer') using semantic similarity. If multiple meanings are found, identify which specifically relate to project teams and responsibility for quality assurance. This step only reads documentation; it does not access or modify any project or employee data.
+Expected Output: {"type":"object","properties":{"qa_term_definitions":{"type":"array","items":{"type":"string"}},"qa_role_labels":{"type":"array","items":{"type":"string"}},"ambiguity_notes":{"type":"array","items":{"type":"string"}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["qa_term_definitions","qa_role_labels","source_paths"]}
+
+CHECKLIST:
+- Did you execute the step instruction?
+- Is there any action you skipped or assumed?
+- Are all facts verified (not assumed)?
+
+JSON response MUST contain ONLY values that were explicitly printed/verified from function returns.
+- You did not use any make-up data or sensiable defaults. All facts should be derived from function returns.
+- If any object is not found - consider using fuzzy matching, partial matching, double checks, etc.
+- Consider applying semantic/logical matching, if term is ambiguous or unclear, or it is abbreviation.
+- If nesseary, consider getting the object's fields value to understand the object better (project status, employee role, custome location, etc.)
+
+update functions are STATE-CHANGING - YOU SHOULD CALL THEM ONLY ONCE!
+
+- if you change state of any object - include explicit full information about this in the <final_answer> section.
+
+If complete, repeat BOTH your <final_answer> AND <json> blocks.
+If something was missed, execute the missing action now.
+
+If you are sure about results - you do not need to verify again. Just provide the <final_answer> and <json> blocks.
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 6)
+--------------------------------------------------------------------------------
+I need to verify my findings more thoroughly by examining the actual content of key wiki files to ensure I haven't missed explicit definitions or conventions about quality assurance roles in project teams.
+
+```python
+# Let's examine the key wiki files in detail to find explicit definitions and conventions
+
+# List of files to examine based on search results
+files_to_examine = [
+    'systems/project_registry.md',
+    'hr/people_and_roles.md', 
+    'hr/example_employee_profiles.md',
+    'operations/factories_and_production.md',
+    'company/history.md'
+]
+
+qa_term_definitions = []
+qa_role_labels = []
+ambiguity_notes = []
+source_paths = []
+
+print("Examining key wiki files for QA definitions and conventions...\n")
+
+for file_path in files_to_examine:
+    print(f"=== Examining {file_path} ===")
+    content = load_wiki(file_path)
+    
+    if content:
+        lines = content.split('\n')
+        
+        # Look for definitions of quality assurance
+        for i, line in enumerate(lines):
+            lower_line = line.lower()
+            
+            # Check for definitions
+            if ('quality assurance' in lower_line or 'qa' in lower_line.lower()) and \
+               ('means' in lower_line or 'defined as' in lower_line or 'refers to' in lower_line or 
+                'is the' in lower_line or 'involves' in lower_line):
+                context = f"Line {i+1}: {line.strip()}"
+                qa_term_definitions.append(context)
+                source_paths.append(file_path)
+                print(f"Found definition: {context}")
+            
+            # Check for role labels
+            if 'role' in lower_line and ('qa' in lower_line or 'quality' in lower_line or 'quality assurance' in lower_line):
+                context = f"Line {i+1}: {line.strip()}"
+                qa_role_labels.append(context)
+                source_paths.append(file_path)
+                print(f"Found role reference: {context}")
+            
+            # Check for project team role specifications
+            if 'lead, engineer, designer, qa, ops, other' in lower_line or \
+               'lead, engineer, designer, qa,' in lower_line:
+                context = f"Line {i+1}: {line.strip()}"
+                qa_role_labels.append(context)
+                source_paths.append(file_path)
+                print(f"Found project role list: {context}")
+        
+        # Also search for "QA" as a standalone role label
+        if 'QA' in content:
+            # Get lines around QA mentions
+            for i, line in enumerate(lines):
+                if 'QA' in line and 'role' in line.lower():
+                    # Get context
+                    start = max(0, i-2)
+                    end = min(len(lines), i+3)
+                    context_lines = lines[start:end]
+                    context = f"Lines {start+1}-{end}: " + " | ".join([l.strip() for l in context_lines if l.strip()])
+                    if context not in qa_role_labels:
+                        qa_role_labels.append(context)
+                        source_paths.append(file_path)
+                        print(f"Found QA role context: {context}")
+    
+    print()
+
+# Now let's specifically search for project team responsibility patterns
+print("\n=== Searching for 'responsible for quality' patterns ===")
+regex_patterns = [
+    r"responsible.*quality",
+    r"qa.*responsible",
+    r"quality.*assurance.*team",
+    r"team.*qa",
+    r"project.*team.*qa",
+    r"qa.*owner",
+    r"quality.*owner"
+]
+
+for pattern in regex_patterns:
+    results = search_wiki(query_regex=pattern)
+    if results:
+        print(f"\nPattern '{pattern}' found {len(results)} matches:")
+        for result in results[:3]:  # Show first 3
+            print(f"  File: {result['path']}, Line {result['linum']}: {result['content'][:100]}...")
+            source_paths.append(result['path'])
+            
+            # Check if this is about project teams
+            if 'project' in result['content'].lower() or 'team' in result['content'].lower():
+                note = f"In {result['path']}: '{result['content'].strip()}'"
+                if note not in ambiguity_notes:
+                    ambiguity_notes.append(note)
+
+# Load and check systems/project_registry.md specifically for team structure
+print("\n=== Detailed analysis of project registry for team roles ===")
+project_registry_content = load_wiki('systems/project_registry.md')
+if project_registry_content:
+    lines = project_registry_content.split('\n')
+    in_team_section = False
+    for i, line in enumerate(lines):
+        if 'team' in line.lower() and 'role' in line.lower():
+            in_team_section = True
+            print(f"Found team/role section at line {i+1}: {line.strip()}")
+        
+        if in_team_section and ('lead' in line.lower() or 'engineer' in line.lower() or 'designer' in line.lower() or 'qa' in line.lower() or 'ops' in line.lower() or 'other' in line.lower()):
+            print(f"  Line {i+1}: {line.strip()}")
+            if 'qa' in line.lower():
+                qa_role_labels.append(f"Project role from systems/project_registry.md: {line.strip()}")
+                source_paths.append('systems/project_registry.md')
+
+# Check HR people and roles for quality assurance job titles
+print("\n=== Checking HR documentation for QA job titles ===")
+hr_content = load_wiki('hr/people_and_roles.md')
+if hr_content:
+    lines = hr_content.split('\n')
+    in_quality_section = False
+    for i, line in enumerate(lines):
+        if 'quality' in line.lower() and 'hse' in line.lower():
+            in_quality_section = True
+            print(f"Found Quality & HSE section: {line.strip()}")
+        
+        if in_quality_section and ('qa technician' in line.lower() or 'quality engineer' in line.lower() or 'quality & hse manager' in line.lower()):
+            print(f"  Line {i+1}: {line.strip()}")
+            qa_role_labels.append(f"Job title from hr/people_and_roles.md: {line.strip()}")
+            source_paths.append('hr/people_and_roles.md')
+
+# Remove duplicates while preserving order
+qa_term_definitions = list(dict.fromkeys(qa_term_definitions))
+qa_role_labels = list(dict.fromkeys(qa_role_labels))
+ambiguity_notes = list(dict.fromkeys(ambiguity_notes))
+source_paths = list(dict.fromkeys(source_paths))
+
+print("\n\n=== FINAL VERIFICATION SUMMARY ===")
+print(f"QA Term Definitions found: {len(qa_term_definitions)}")
+for i, defn in enumerate(qa_term_definitions):
+    print(f"  {i+1}. {defn}")
+
+print(f"\nQA Role Labels found: {len(qa_role_labels)}")
+for i, label in enumerate(qa_role_labels):
+    print(f"  {i+1}. {label}")
+
+print(f"\nAmbiguity Notes found: {len(ambiguity_notes)}")
+for i, note in enumerate(ambiguity_notes):
+    print(f"  {i+1}. {note}")
+
+print(f"\nSource paths: {source_paths}")
+
+# Let's also check if there are any explicit mentions of "somebody responsible for quality assurance"
+print("\n=== Checking for 'somebody responsible for quality assurance' phrasing ===")
+explicit_search = search_wiki(query_regex=r"somebody responsible|responsible for quality|qa responsible")
+if explicit_search:
+    print("Found explicit mentions:")
+    for result in explicit_search:
+        print(f"  File: {result['path']}, Line {result['linum']}: {result['content'][:100]}...")
+else:
+    print("No explicit mentions found of 'somebody responsible for quality assurance'")
+```
+
+--------------------------------------------------------------------------------
+[USER] (message 7)
+--------------------------------------------------------------------------------
+Code execution result:
+STDOUT:
+Examining key wiki files for QA definitions and conventions...
+
+=== Examining systems/project_registry.md ===
+Found role reference: Line 37: - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+Found project role list: Line 37: - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+Found role reference: Line 68: * `Role` – the project role (Lead, Engineer, QA, Ops, Other)
+Found QA role context: Lines 35-39: - Team and workloads: | - Which employees are assigned | - Their role (Lead, Engineer, Designer, QA, Ops, Other) | - Their approximate time slice (fraction of an FTE)
+Found QA role context: Lines 66-70: * `Employee` – the employee ID | * `TimeSlice` – the fraction of a full-time equivalent (FTE) that the employee is expected to contribute to that project (e.g. 0.1, 0.3, 0.5, 1.0) | * `Role` – the project role (Lead, Engineer, QA, Ops, Other) | These allocations are defined and maintained in the **project registry**, which is the system of record for planned workload assignments.
+
+=== Examining hr/people_and_roles.md ===
+Found role reference: Line 53: Production roles ensure safe, efficient execution of recipes and cooperate with QA and logistics.
+Found QA role context: Lines 51-55: - **Maintenance Technician** | Production roles ensure safe, efficient execution of recipes and cooperate with QA and logistics. | ### Logistics & Supply Chain
+
+=== Examining hr/example_employee_profiles.md ===
+
+=== Examining operations/factories_and_production.md ===
+
+=== Examining company/history.md ===
+
+
+=== Searching for 'responsible for quality' patterns ===
+
+=== Detailed analysis of project registry for team roles ===
+
+=== Checking HR documentation for QA job titles ===
+Found Quality & HSE section: - **Quality & HSE**
+Found Quality & HSE section: ### Quality & HSE
+Found Quality & HSE section: - **Quality & HSE Manager**
+  Line 66: - **Quality & HSE Manager**
+  Line 67: - **Quality Engineer**
+  Line 68: - **QA Technician**
+
+
+=== FINAL VERIFICATION SUMMARY ===
+QA Term Definitions found: 0
+
+QA Role Labels found: 9
+  1. Line 37: - Their role (Lead, Engineer, Designer, QA, Ops, Other)
+  2. Line 68: * `Role` – the project role (Lead, Engineer, QA, Ops, Other)
+  3. Lines 35-39: - Team and workloads: | - Which employees are assigned | - Their role (Lead, Engineer, Designer, QA, Ops, Other) | - Their approximate time slice (fraction of an FTE)
+  4. Lines 66-70: * `Employee` – the employee ID | * `TimeSlice` – the fraction of a full-time equivalent (FTE) that the employee is expected to contribute to that project (e.g. 0.1, 0.3, 0.5, 1.0) | * `Role` – the project role (Lead, Engineer, QA, Ops, Other) | These allocations are defined and maintained in the **project registry**, which is the system of record for planned workload assignments.
+  5. Line 53: Production roles ensure safe, efficient execution of recipes and cooperate with QA and logistics.
+  6. Lines 51-55: - **Maintenance Technician** | Production roles ensure safe, efficient execution of recipes and cooperate with QA and logistics. | ### Logistics & Supply Chain
+  7. Job title from hr/people_and_roles.md: - **Quality & HSE Manager**
+  8. Job title from hr/people_and_roles.md: - **Quality Engineer**
+  9. Job title from hr/people_and_roles.md: - **QA Technician**
+
+Ambiguity Notes found: 0
+
+Source paths: ['systems/project_registry.md', 'hr/people_and_roles.md']
+
+=== Checking for 'somebody responsible for quality assurance' phrasing ===
+No explicit mentions found of 'somebody responsible for quality assurance'
+
+--------------------------------------------------------------------------------
+[ASSISTANT] (message 8)
+--------------------------------------------------------------------------------
+Based on my thorough verification of the company wiki documentation, I have completed Step 1 as requested. I searched the internal wiki using fuzzy and semantic matching to understand quality assurance roles in the company context.
+
+<final_answer>
+I have executed Step 1 by thoroughly searching the company wiki documentation. The analysis reveals that "quality assurance" (QA) in the company context maps to specific role labels used in project teams and job titles. The most relevant finding is that in project teams, "QA" is one of the standard role labels in the project registry system alongside Lead, Engineer, Designer, Ops, and Other. Additionally, there are job titles like "QA Technician" and "Quality Engineer" in the Quality & HSE department. No explicit definitions of "quality assurance" as a term were found in the wiki, but the role conventions are clearly established in the project registry documentation.
+</final_answer>
+
+<json>
+{
+  "qa_term_definitions": [],
+  "qa_role_labels": ["QA", "QA Technician", "Quality Engineer", "Quality & HSE Manager"],
+  "ambiguity_notes": ["The term 'QA' appears in two distinct contexts: 1) As a project team role label ('QA') in the project registry system, which is one of the standard roles (Lead, Engineer, Designer, QA, Ops, Other) assigned to team members. 2) As job titles in the Quality & HSE department (QA Technician, Quality Engineer, Quality & HSE Manager). For project team composition and responsibility for quality assurance, the role label 'QA' in the project registry is the relevant mapping."],
+  "source_paths": ["systems/project_registry.md", "hr/people_and_roles.md"]
+}</json>
